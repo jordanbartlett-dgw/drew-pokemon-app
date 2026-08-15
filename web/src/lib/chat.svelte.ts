@@ -79,6 +79,13 @@ export function createChat() {
 	}
 
 	async function load(id: number): Promise<void> {
+		// A conversation from the sidebar can be opened while a previous send()
+		// is still streaming. That request's late frames must not land on the
+		// conversation we're about to load.
+		activeController?.abort();
+		activeController = null;
+		busy = false;
+
 		const detail = await loadConversation(id);
 		if (!detail) return;
 		conversationId = id;

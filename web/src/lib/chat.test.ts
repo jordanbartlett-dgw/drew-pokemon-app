@@ -155,4 +155,60 @@ describe('createChat', () => {
 		expect(chat.messages[0].text).toBe('second question');
 		expect(chat.busy).toBe(false);
 	});
+
+	it('load() during an in-flight send aborts the stream instead of letting late frames pollute the loaded conversation', async () => {
+		let resolveFetch: (value: Response) => void = () => {};
+		const fetchMock = vi.fn().mockImplementation(
+			() =>
+				new Promise<Response>((resolve) => {
+					resolveFetch = resolve;
+				})
+		);
+		vi.stubGlobal('fetch', fetchMock);
+		const chat = createChat();
+
+		const abandoned = chat.send('first question');
+
+		const loadedTurns = [
+			{
+				id: 1,
+				user_text: 'earlier question',
+				assistant_text: 'earlier answer',
+				tool_events: [],
+				created_at: '2026-01-01T00:00:00Z'
+			}
+		];
+		fetchMock.mockImplementationOnce(() =>
+			Promise.resolve(
+				new Response(
+					JSON.stringify({
+						conversation: { id: 3, title: 'earlier question', created_at: '', updated_at: '', turn_count: 1 },
+						turns: loadedTurns
+					}),
+					{ status: 200 }
+				)
+			)
+		);
+
+		await chat.load(3);
+
+		expect(chat.busy).toBe(false);
+		expect(chat.error).toBeNull();
+		expect(chat.conversationId).toBe(3);
+		expect(chat.messages).toHaveLength(2);
+		expect(chat.messages[0].text).toBe('earlier question');
+		expect(chat.messages[1].text).toBe('earlier answer');
+
+		// The abandoned send's frames finally arrive after load(); they must not
+		// mutate the freshly loaded conversation.
+		resolveFetch(sseResponse(FRAMES));
+		await abandoned;
+		flushSync();
+
+		expect(chat.messages).toHaveLength(2);
+		expect(chat.messages[0].text).toBe('earlier question');
+		expect(chat.messages[1].text).toBe('earlier answer');
+		expect(chat.busy).toBe(false);
+		expect(chat.error).toBeNull();
+	});
 });
