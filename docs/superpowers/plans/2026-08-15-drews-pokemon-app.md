@@ -1725,6 +1725,16 @@ git commit -m "feat: domain models"
 - Consumes: nothing
 - Produces: `api.sql_guard.UnsafeSqlError(Exception)`, `api.sql_guard.MAX_ROWS = 200`, and `api.sql_guard.validate_sql(sql: str) -> str` which returns the query with a `LIMIT` enforced or raises `UnsafeSqlError`.
 
+> **Amendment (2026-08-15, two adversarial rounds during execution).** The Step 3 reference code below is **unsafe as written** and was hardened. Six real defects were found and fixed:
+> 1. **Comments hid forbidden keywords and statements.** `SELECT 1 -- DROP TABLE pokemon` and `SELECT /* ATTACH */ 1` passed. Comments are now rejected outright, and comments plus string literals are scrubbed (length-preserving) before the keyword scan.
+> 2. **String literals caused false positives.** The scan now runs against scrubbed text while the returned SQL is rebuilt from the original, so `WHERE name = 'Farfetch''d'` passes and `SELECT hatch_date AS create_date` is not falsely rejected.
+> 3. **`LIMIT n OFFSET m` produced a double `LIMIT`.**
+> 4. **Non-integer LIMIT arguments produced invalid SQL.** `LIMIT 0,10`, `LIMIT -1`, `LIMIT 5+5`, floats, hex, `NULL`, bound params and subquery expressions all became `... LIMIT 200`. Only a bare integer, optionally with `OFFSET`, is accepted; everything else raises a retry-friendly `UnsafeSqlError`.
+> 5. **A subquery-scoped LIMIT with no outer LIMIT** was misread as a malformed top-level clause. Resolved with a paren-balance check.
+> 6. **A parenthesized top-level SELECT was accepted but invalid.** `(SELECT ... LIMIT 5000)` became `(...) LIMIT 200`. A leading `(` is now rejected rather than stripped.
+>
+> The invariant to preserve: **every acceptance returns SQL that SQLite parses, every rejection raises `UnsafeSqlError`, and there is no third outcome** where the guard passes something SQLite refuses. A third outcome is how the retry loop burns the daily budget silently. Malformed SQL the model itself wrote (e.g. `SELECT 1 UNION (SELECT 2)`) is out of scope for a shape guard — Task 12's `run_sql` converts `sqlite3.Error` to `ModelRetry`, so it still reaches the model as correctable feedback. Implemented in `e317183`, `8d8c552`, `112c7a8`; 39 tests.
+
 - [ ] **Step 1: Write the failing test**
 
 `tests/api/test_sql_guard.py`:
