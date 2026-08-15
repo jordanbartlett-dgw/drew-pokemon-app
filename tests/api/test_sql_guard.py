@@ -92,3 +92,21 @@ def test_rejects_case_and_whitespace_variations():
         validate_sql("AtTaCh DATABASE 'x.db' AS x")
     with pytest.raises(UnsafeSqlError):
         validate_sql("ATTACH\tDATABASE 'x.db' AS x")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT id FROM v_pokemon LIMIT 0,10",
+        "SELECT 1 LIMIT -1",
+        "SELECT 1 LIMIT 5+5",
+    ],
+)
+def test_rejects_non_integer_limit_forms(sql):
+    with pytest.raises(UnsafeSqlError, match="plain whole number"):
+        validate_sql(sql)
+
+
+def test_nested_limit_without_outer_limit_gets_outer_limit_appended():
+    out = validate_sql("SELECT * FROM (SELECT * FROM v_pokemon LIMIT 5) AS t")
+    assert out == f"SELECT * FROM (SELECT * FROM v_pokemon LIMIT 5) AS t LIMIT {MAX_ROWS}"

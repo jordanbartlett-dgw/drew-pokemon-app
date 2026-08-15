@@ -8,8 +8,26 @@ _FORBIDDEN = re.compile(
     r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|ATTACH|DETACH|PRAGMA|CREATE|REPLACE|VACUUM|REINDEX)\b",
     re.IGNORECASE,
 )
-_LIMIT = re.compile(r"\bLIMIT\s+(\d+)(\s+OFFSET\s+\d+)?\s*$", re.IGNORECASE)
+_LIMIT_KEYWORD = re.compile(r"\bLIMIT\b", re.IGNORECASE)
+# The only two LIMIT shapes we support: a plain non-negative integer, and
+# that integer plus an OFFSET. SQLite's actual grammar also allows negative
+# integers, floats, hex literals, arithmetic expressions, and a `LIMIT a,b`
+# offset-then-count form -- all syntactically valid on their own, but every
+# one of them would silently produce a double-LIMIT syntax error once we
+# append or substitute our own `LIMIT {MAX_ROWS}`, so anything outside these
+# two shapes is rejected rather than guessed at.
+_LIMIT_CLAUSE = re.compile(r"^\s+(\d+)(\s+OFFSET\s+\d+)?\s*$", re.IGNORECASE)
 _STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+
+
+def _blank_strings(text: str) -> str:
+    """Replace string literal contents with '#' filler, keeping the length the same.
+
+    Preserving length keeps character offsets identical between the scrubbed
+    text and the original, so positions found by searching the scrubbed text
+    can be used to slice the original directly.
+    """
+    return _STRING_LITERAL.sub(lambda m: "'" + "#" * (len(m.group(0)) - 2) + "'", text)
 
 
 class UnsafeSqlError(Exception):
@@ -29,10 +47,12 @@ def validate_sql(sql: str) -> str:
 
     # Blank out string literal contents first so keywords or markers inside a
     # legitimate value (e.g. WHERE name = 'Porygon-Z') never trigger the
-    # comment/keyword/semicolon checks below. All checks run against
+    # comment/keyword/semicolon/LIMIT checks below. All checks run against
     # `scrubbed`, but the SQL we return is built from `cleaned` so the
-    # original query text (including string values) is preserved.
-    scrubbed = _STRING_LITERAL.sub("''", cleaned)
+    # original query text (including string values) is preserved. The blank
+    # filler keeps the same length as the original literal, so any position
+    # found in `scrubbed` is also a valid position in `cleaned`.
+    scrubbed = _blank_strings(cleaned)
 
     if "--" in scrubbed or "/*" in scrubbed:
         # A trailing line comment would silently swallow the LIMIT clause we
@@ -59,14 +79,37 @@ def validate_sql(sql: str) -> str:
             "DETACH, PRAGMA, CREATE, REPLACE, VACUUM, or REINDEX)."
         )
 
-    # Matched against `cleaned` (not `scrubbed`): the pattern is anchored to
-    # the very end of the string, and a string literal containing text that
-    # looks like "LIMIT 5" can never reach that end anchor unescaped because
-    # its closing quote sits after it. So no separate scrub is needed here.
-    match = _LIMIT.search(cleaned)
-    if match is None:
+    # Find the outermost, trailing `LIMIT` keyword outside of any string
+    # literal. A query can legitimately contain an earlier LIMIT scoped to a
+    # subquery (e.g. `SELECT * FROM (SELECT * FROM v_pokemon LIMIT 1) LIMIT
+    # 5`, or `SELECT * FROM (SELECT * FROM v_pokemon LIMIT 5) AS t` with no
+    # outer LIMIT at all) -- only the clause that actually caps the final
+    # result set matters for enforcement; a LIMIT still followed by an
+    # unmatched `)` is scoped to a subquery that closes later, so it's
+    # skipped. Walk right-to-left so the first candidate found is the
+    # rightmost one that is not nested this way.
+    candidate = None
+    for keyword in reversed(list(_LIMIT_KEYWORD.finditer(scrubbed))):
+        suffix = scrubbed[keyword.end() :]
+        if suffix.count(")") > suffix.count("("):
+            continue  # scoped to a subquery that closes later; not the trailing clause
+        candidate = keyword
+        break
+
+    if candidate is None:
         return f"{cleaned} LIMIT {MAX_ROWS}"
-    if int(match.group(1)) > MAX_ROWS:
-        offset_clause = match.group(2) or ""
-        return f"{cleaned[: match.start()]}LIMIT {MAX_ROWS}{offset_clause}"
+
+    clause = scrubbed[candidate.end() :]
+    clause_match = _LIMIT_CLAUSE.match(clause)
+    if clause_match is None:
+        raise UnsafeSqlError(
+            "The LIMIT clause must be a plain whole number, like 'LIMIT 50', optionally "
+            "with OFFSET, like 'LIMIT 50 OFFSET 10'. Forms like 'LIMIT a,b', 'LIMIT -1', "
+            "and expressions are not supported."
+        )
+
+    limit_value = int(clause_match.group(1))
+    if limit_value > MAX_ROWS:
+        offset_clause = clause_match.group(2) or ""
+        return f"{cleaned[: candidate.start()]}LIMIT {MAX_ROWS}{offset_clause}"
     return cleaned
