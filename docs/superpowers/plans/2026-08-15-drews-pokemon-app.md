@@ -3681,7 +3681,7 @@ Expected: all green.
 - [ ] **Step 6: Start the server and check it by hand**
 
 ```bash
-infisical run -- uv run fastapi dev api/app.py --port 8000
+infisical run -- uv run uvicorn api.app:app --port 8000 --reload
 ```
 
 In a second terminal:
@@ -5399,7 +5399,7 @@ git commit -m "feat: single-process deploy with systemd and tailscale serve"
 Terminal one:
 
 ```bash
-infisical run -- uv run fastapi dev api/app.py --port 8000
+infisical run -- uv run uvicorn api.app:app --port 8000 --reload
 ```
 
 Terminal two:
@@ -5483,7 +5483,7 @@ artwork into `data/images/`. Pass `--skip-images` to skip the slow part.
 Development, two processes:
 
 ```bash
-infisical run -- uv run fastapi dev api/app.py --port 8000   # terminal one
+infisical run -- uv run uvicorn api.app:app --port 8000 --reload   # terminal one
 cd web && npm run dev                                        # terminal two
 ```
 
