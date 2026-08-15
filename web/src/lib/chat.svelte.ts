@@ -13,6 +13,8 @@ export function createChat() {
 	let busy = $state(false);
 	let error = $state<string | null>(null);
 	let conversationId = $state<number | null>(null);
+	// Plain (non-reactive) handle to the in-flight request so reset() can cancel it.
+	let activeController: AbortController | null = null;
 
 	async function send(text: string): Promise<void> {
 		const question = text.trim();
@@ -21,36 +23,59 @@ export function createChat() {
 		error = null;
 		busy = true;
 		messages.push({ role: 'user', text: question, toolEvents: [] });
+		messages.push({ role: 'assistant', text: '', toolEvents: [] });
+		// `$state` arrays deep-proxy their contents: `messages.push(...)` wraps the
+		// pushed object in a NEW proxy. Mutating the object literal we just pushed
+		// (a detached reference) bypasses that proxy's `set` trap entirely, so no
+		// reactive consumer is ever notified. Re-reading the element back out of the
+		// array gives us the live, proxy-wrapped element instead.
+		const assistantIndex = messages.length - 1;
 
-		const assistant: ChatMessage = { role: 'assistant', text: '', toolEvents: [] };
-		messages.push(assistant);
+		const controller = new AbortController();
+		activeController = controller;
 
 		try {
-			for await (const event of streamChat(question, conversationId)) {
+			for await (const event of streamChat(question, conversationId, controller.signal)) {
+				if (controller.signal.aborted) break;
+				// reset() may have replaced `messages` with a fresh array mid-stream;
+				// a late frame from the abandoned request must not touch it.
+				const live = messages[assistantIndex];
+				if (!live) break;
+
 				if (event.name === 'start') {
 					conversationId = event.data.conversation_id;
 				} else if (event.name === 'token') {
-					assistant.text += event.data.text;
+					live.text += event.data.text;
 				} else if (event.name === 'tool') {
-					assistant.toolEvents.push(event.data);
+					live.toolEvents.push(event.data);
 				} else if (event.name === 'limit') {
 					// Budget or loop cap. Drew sees a sentence, not an error banner.
-					assistant.text = event.data.message;
+					live.text = event.data.message;
 				} else if (event.name === 'error') {
 					error = event.data.message;
 				}
 			}
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : String(cause);
+			if (!controller.signal.aborted) {
+				error = cause instanceof Error ? cause.message : String(cause);
+			}
 		} finally {
-			busy = false;
+			// If reset() already fired, it owns `busy`/`activeController` — don't
+			// clobber a newer send's state with this abandoned request's cleanup.
+			if (activeController === controller) {
+				busy = false;
+				activeController = null;
+			}
 		}
 	}
 
 	function reset(): void {
+		activeController?.abort();
+		activeController = null;
 		messages = [];
 		conversationId = null;
 		error = null;
+		busy = false;
 	}
 
 	async function load(id: number): Promise<void> {

@@ -1,5 +1,7 @@
+import { flushSync } from 'svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createChat } from './chat.svelte';
+import { trackReactive } from './reactivity-probe.svelte';
 
 function sseResponse(frames: string[]): Response {
 	const stream = new ReadableStream({
@@ -98,5 +100,59 @@ describe('createChat', () => {
 		await Promise.all([first, second]);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(chat.messages.filter((m) => m.role === 'user')).toHaveLength(1);
+	});
+
+	it('notifies a live reactive subscriber as tokens stream in, not just the final read', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse(FRAMES)));
+		const chat = createChat();
+
+		// `send`'s synchronous prefix (both `messages.push` calls) has already run
+		// by the time this line executes: the first `await` inside `send` is
+		// buried inside `streamChat`'s `await fetch(...)`, so control returns to
+		// this test before any frame is read. A real component's `{#each}` would
+		// read `.text` at exactly this point -- while it is still empty -- which
+		// is what creates the tracked signal the bug silently stops updating.
+		const sendPromise = chat.send('Who is Pikachu?');
+		const tracker = trackReactive(() => chat.messages[1]?.text ?? '');
+
+		await sendPromise;
+		flushSync();
+
+		expect(tracker.values.at(-1)).toBe('Pikachu is quick!');
+		tracker.stop();
+	});
+
+	it('reset() during an in-flight send cancels cleanly instead of leaking into the next one', async () => {
+		let resolveFetch: (value: Response) => void = () => {};
+		const fetchMock = vi.fn().mockImplementation(
+			() =>
+				new Promise<Response>((resolve) => {
+					resolveFetch = resolve;
+				})
+		);
+		vi.stubGlobal('fetch', fetchMock);
+		const chat = createChat();
+
+		const abandoned = chat.send('first question');
+		chat.reset();
+
+		expect(chat.busy).toBe(false);
+		expect(chat.messages).toHaveLength(0);
+		expect(chat.error).toBeNull();
+
+		// The abandoned request finally resolves after the reset; its frames
+		// must not resurrect the old conversation or flip busy back on.
+		resolveFetch(sseResponse(FRAMES));
+		await abandoned;
+		flushSync();
+		expect(chat.messages).toHaveLength(0);
+		expect(chat.busy).toBe(false);
+		expect(chat.error).toBeNull();
+
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse(FRAMES)));
+		await chat.send('second question');
+		expect(chat.messages[0].role).toBe('user');
+		expect(chat.messages[0].text).toBe('second question');
+		expect(chat.busy).toBe(false);
 	});
 });
