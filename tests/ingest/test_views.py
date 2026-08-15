@@ -44,6 +44,27 @@ def conn():
         INSERT INTO evolution_triggers VALUES (3,'use-item');
         INSERT INTO pokemon_evolution
             (id,evolved_species_id,evolution_trigger_id,minimum_level) VALUES (1,26,3,NULL);
+        INSERT INTO pokemon VALUES (6,'charizard',6,17,905,240,8,1);
+        INSERT INTO pokemon_species
+            (id,identifier,generation_id,evolves_from_species_id,
+             evolution_chain_id,is_legendary,is_mythical)
+            VALUES (6,'charizard',1,5,2,0,0);
+        INSERT INTO types VALUES (10,'fire',1,3);
+        INSERT INTO types VALUES (3,'flying',1,2);
+        INSERT INTO type_names VALUES (10,9,'Fire');
+        INSERT INTO type_names VALUES (3,9,'Flying');
+        INSERT INTO pokemon_types VALUES (6,10,1);
+        INSERT INTO pokemon_types VALUES (6,3,2);
+        INSERT INTO moves
+            (id,identifier,type_id,power,accuracy) VALUES (85,'thunderbolt',13,90,100);
+        INSERT INTO move_names VALUES (85,9,'Thunderbolt');
+        INSERT INTO pokemon_move_methods VALUES (1,'level-up');
+        INSERT INTO pokemon_moves
+            (pokemon_id,version_group_id,move_id,pokemon_move_method_id,level)
+            VALUES (25,1,85,1,26);
+        INSERT INTO pokemon_moves
+            (pokemon_id,version_group_id,move_id,pokemon_move_method_id,level)
+            VALUES (25,2,85,1,26);
         """
     )
     c.commit()
@@ -88,3 +109,22 @@ def test_v_evolution_links_species(conn):
     assert row["to_name"] == "Raichu"
     assert row["trigger"] == "use-item"
     assert row["chain_id"] == 10
+
+
+def test_v_pokemon_second_type(conn):
+    row = conn.execute("SELECT * FROM v_pokemon WHERE id = 6").fetchone()
+    assert row["type1"] == "Fire"
+    assert row["type2"] == "Flying"
+
+
+def test_v_pokemon_moves_returns_distinct_rows(conn):
+    rows = conn.execute(
+        "SELECT * FROM v_pokemon_moves WHERE pokemon = 'Pikachu' AND move = 'Thunderbolt'"
+    ).fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["method"] == "level-up"
+    assert row["level"] == 26
+    assert row["move_type"] == "Electric"
+    assert row["power"] == 90
+    assert row["accuracy"] == 100
