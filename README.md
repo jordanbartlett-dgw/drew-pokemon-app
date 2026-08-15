@@ -59,23 +59,56 @@ Do not use `fastapi dev`; it requires `fastapi[standard]`, which is not a
 dependency of this project. `uv run uvicorn ...` is the supported entry point.
 
 On the Minisforum it runs as a single process under systemd, published to the
-tailnet. Before the first `install.sh` run, create the env file the unit
-requires (`deploy/drews-pokemon-app.service`'s `EnvironmentFile`, no leading
-`-`, so systemd refuses to start without it):
+tailnet.
+
+### Creating the Infisical machine identity
+
+The service runs unattended, so it cannot use your interactive `infisical
+login` — that session expires. It authenticates as a **machine identity**
+instead.
+
+1. In Infisical, go to **Organization Access Control → Identities → Create
+   Identity**. Name it something like `drews-pokemon-app`. The organisation
+   role can be *No Access*; project access is granted separately in step 3.
+2. On that identity, add **Universal Auth** as the authentication method. Copy
+   the **Client ID**, then create a **Client Secret** and copy it — the secret
+   is shown once and cannot be retrieved later.
+3. Open the **drew-pokemon** project → **Access Control → Identities → Add
+   Identity**, select the identity, and give it a role with read access to
+   secrets in the **prod** environment. Viewer is enough.
+
+Verify it works before installing anything:
 
 ```bash
+token=$(infisical login --method=universal-auth \
+  --client-id=<client id> --client-secret=<client secret> --plain --silent)
+infisical run --projectId=5c61531e-4dac-4347-b133-ff60bc484db5 \
+  --env=prod --token="$token" -- printenv | cut -d= -f1 | grep OPENAI_API_KEY
+```
+
+That should print `OPENAI_API_KEY`. If it prints nothing, the identity does not
+have access to the prod environment of that project.
+
+### The environment file
+
+`deploy/drews-pokemon-app.service` declares `EnvironmentFile` with no leading
+`-`, so systemd refuses to start without it:
+
+```bash
+mkdir -p ~/.config
 cat > ~/.config/drews-pokemon-app.env <<'EOF'
-INFISICAL_TOKEN=<machine identity client secret, from the Infisical dashboard>
-INFISICAL_PROJECT_ID=<the drew-pokemon project's ID, from its Infisical URL/settings>
+INFISICAL_CLIENT_ID=<client id from step 2>
+INFISICAL_CLIENT_SECRET=<client secret from step 2>
+INFISICAL_PROJECT_ID=5c61531e-4dac-4347-b133-ff60bc484db5
 EOF
 chmod 600 ~/.config/drews-pokemon-app.env
 ```
 
-`INFISICAL_TOKEN` comes from an Infisical machine identity (Organization
-Settings → Machine Identities), scoped to the `drew-pokemon` project;
-`INFISICAL_PROJECT_ID` is that project's ID, visible in its Infisical URL or
-Project Settings. Both are secrets — `chmod 600` keeps them readable only by
-this user. `install.sh` checks the file exists before doing anything else.
+Note this holds the client id and secret, **not** a token. Universal Auth
+access tokens expire, so `deploy/run.sh` mints a fresh one on every service
+start. A static token would work until the first reboot after it expired and
+then fail with a confusing auth error. `install.sh` checks all three variables
+are present before installing anything.
 
 ```bash
 ./deploy/install.sh
@@ -84,12 +117,10 @@ tailscale serve status
 ```
 
 `install.sh` builds the frontend into `web/build`, installs the user systemd
-unit, and publishes port 8000 over Tailscale HTTPS. It needs the env file
-above, an Infisical machine identity configured on the Minisforum (`infisical
-run --` in the unit authenticates as that identity, not as a logged-in user),
-and `sudo` for `tailscale serve`. These are things only Jordan sets up; the
-script preflights that the env file exists and that the `infisical` and `uv`
-binary paths in the unit still match what's on `PATH` before touching anything.
+unit, and publishes port 8000 over Tailscale HTTPS. It needs the env file above and
+`sudo` for `tailscale serve`. The script preflights that the env file exists
+and holds all three variables, and that the `infisical` and `uv` paths in
+`deploy/run.sh` still match what's on `PATH`, before touching anything.
 
 Drew opens `https://<host>.<tailnet>.ts.net` on his iPad. The app binds to
 `127.0.0.1` only; Tailscale is the only way in.

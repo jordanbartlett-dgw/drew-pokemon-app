@@ -7,15 +7,21 @@ UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_NAME="drews-pokemon-app.service"
 UNIT_FILE="$REPO_ROOT/deploy/$UNIT_NAME"
 
-# --- Preflight: every binary the unit's ExecStart references must exist at
-# the path it names, and must match what's actually installed right now.
+# --- Preflight: every binary deploy/run.sh references must exist at the path
+# it names, and must match what's actually installed right now.
 # `infisical`'s path is pinned to a specific nvm/Node version, so a Node
 # upgrade silently breaks the unit; catching that here, before anything is
 # installed, beats a service that fails at boot with a confusing error.
-echo "Checking the systemd unit's binary paths..."
+echo "Checking the launcher's binary paths..."
 
-infisical_unit_path="$(grep -oE '%h\S*infisical' "$UNIT_FILE" | head -1 | sed "s|%h|$HOME|")"
-uv_unit_path="$(grep -oE '%h\S*/uv\b' "$UNIT_FILE" | head -1 | sed "s|%h|$HOME|")"
+RUN_SCRIPT="$REPO_ROOT/deploy/run.sh"
+if [[ ! -x "$RUN_SCRIPT" ]]; then
+	echo "ERROR: $RUN_SCRIPT is missing or not executable." >&2
+	exit 1
+fi
+
+infisical_unit_path="$(grep -oE 'INFISICAL_BIN="[^"]+"' "$RUN_SCRIPT" | head -1 | sed 's|.*="||; s|"$||; s|\$HOME|'"$HOME"'|')"
+uv_unit_path="$(grep -oE 'UV_BIN="[^"]+"' "$RUN_SCRIPT" | head -1 | sed 's|.*="||; s|"$||; s|\$HOME|'"$HOME"'|')"
 
 # The unit's EnvironmentFile has no leading '-', so systemd refuses to even start
 # without it -- and ${INFISICAL_PROJECT_ID} in ExecStart comes from it. Catching a
@@ -28,16 +34,30 @@ if [[ ! -f "$env_file" ]]; then
 	exit 1
 fi
 
+for var in INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
+	if ! grep -q "^${var}=" "$env_file"; then
+		echo "ERROR: $env_file is missing ${var}." >&2
+		echo "       Universal Auth needs a client id and secret, not a static token." >&2
+		echo "       See the deploy section of README.md." >&2
+		exit 1
+	fi
+done
+
+if grep -q "^INFISICAL_TOKEN=" "$env_file"; then
+	echo "WARNING: $env_file still sets INFISICAL_TOKEN. That is no longer used;" >&2
+	echo "         the token is minted at each start by deploy/run.sh. Safe to remove." >&2
+fi
+
 if [[ -z "$infisical_unit_path" || -z "$uv_unit_path" ]]; then
-	echo "ERROR: could not find both an infisical and a uv path in $UNIT_FILE's ExecStart." >&2
-	echo "       Check the ExecStart line hasn't drifted from the expected format." >&2
+	echo "ERROR: could not find both INFISICAL_BIN and UV_BIN in $RUN_SCRIPT." >&2
+	echo "       Check those assignments haven't drifted from the expected format." >&2
 	exit 1
 fi
 
 for bin_path in "$infisical_unit_path" "$uv_unit_path"; do
 	if [[ ! -x "$bin_path" ]]; then
-		echo "ERROR: $UNIT_NAME references '$bin_path', which does not exist or is not executable." >&2
-		echo "       Run 'which infisical uv' and fix ExecStart in $UNIT_FILE, then re-run this script." >&2
+		echo "ERROR: run.sh references '$bin_path', which does not exist or is not executable." >&2
+		echo "       Run 'which infisical uv' and fix the paths in $RUN_SCRIPT, then re-run this script." >&2
 		exit 1
 	fi
 done

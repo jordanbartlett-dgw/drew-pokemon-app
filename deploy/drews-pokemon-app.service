@@ -7,14 +7,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/Developer/drew/pokemon_app
 EnvironmentFile=%h/.config/drews-pokemon-app.env
-# `infisical` is installed via nvm, so this path is pinned to a specific Node
-# version (currently v24.14.1) rather than a stable location. Re-run
-# `which infisical` after any Node upgrade and update this path -- a stale
-# path fails at boot with a confusing "No such file or directory", long after
-# whatever change actually caused it. `deploy/install.sh` checks this path
-# before installing the unit and will refuse to install a stale one.
-ExecStart=%h/.nvm/versions/node/v24.14.1/bin/infisical run --projectId=${INFISICAL_PROJECT_ID} --env=prod -- \
-    %h/.local/bin/uv run uvicorn api.app:app --host 127.0.0.1 --port 8000
+# The token is minted at every start by deploy/run.sh, because Universal Auth
+# access tokens expire. See that script for why a static token in the
+# EnvironmentFile is wrong. Binary paths live in run.sh; install.sh preflights
+# them and refuses to install a stale unit.
+ExecStart=%h/Developer/drew/pokemon_app/deploy/run.sh
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
