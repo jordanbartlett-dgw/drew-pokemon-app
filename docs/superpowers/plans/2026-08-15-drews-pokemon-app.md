@@ -1410,6 +1410,8 @@ git commit -m "feat: ingest orchestrator with verification"
 - Consumes: nothing
 - Produces: `api.db.open_read_only(db_path: Path) -> sqlite3.Connection` and `api.db.query(conn, sql: str, params: tuple = ()) -> list[dict[str, Any]]`.
 
+> **Amendment (2026-08-15, ruled during execution).** Two corrections to the Step 3 code below. (1) The docstring claimed "Writes raise sqlite3.OperationalError" — untrue, since `mode=ro` protects only the main database file and does not block `ATTACH`, `PRAGMA`, or temp tables. Those are `api/sql_guard.py`'s job; the docstring now says so. (2) `check_same_thread=False` does not make a connection thread-safe, and Task 16 shares one connection across FastAPI's threadpool. `query()` now acquires a module-level `threading.Lock` around both the `execute` and the row materialisation, making the shared-connection pattern safe by construction. Covered by a 8-thread × 50-query concurrency test. Implemented in `e5fa57b`.
+
 - [ ] **Step 1: Write the failing test**
 
 `tests/api/test_db.py`:
