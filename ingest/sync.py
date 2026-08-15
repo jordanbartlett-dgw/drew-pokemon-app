@@ -80,6 +80,26 @@ def verify(db_path: Path) -> list[str]:
     if empty:
         failures.append(f"Empty tables: {', '.join(sorted(empty))}")
 
+    eevee_evolutions = conn.execute(
+        "SELECT COUNT(*) FROM v_evolution WHERE from_name = 'Eevee'"
+    ).fetchone()[0]
+    if eevee_evolutions != 8:
+        failures.append(f"Eevee's evolution chain has {eevee_evolutions} rows, expected 8")
+
+    duplicate_evolutions = conn.execute(
+        """
+        SELECT chain_id, from_name, to_name, COUNT(*) AS n
+        FROM v_evolution
+        GROUP BY chain_id, from_name, to_name
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    if duplicate_evolutions:
+        pairs = ", ".join(
+            f"{r['from_name']}->{r['to_name']} (x{r['n']})" for r in duplicate_evolutions
+        )
+        failures.append(f"v_evolution has duplicate evolution rows: {pairs}")
+
     conn.close()
     return failures
 

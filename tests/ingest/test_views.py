@@ -43,7 +43,8 @@ def conn():
             (26,1,60,0),(26,2,90,0),(26,3,55,0),(26,4,90,0),(26,5,80,0),(26,6,110,0);
         INSERT INTO evolution_triggers VALUES (3,'use-item');
         INSERT INTO pokemon_evolution
-            (id,evolved_species_id,evolution_trigger_id,minimum_level) VALUES (1,26,3,NULL);
+            (id,evolved_species_id,evolution_trigger_id,is_default,minimum_level)
+            VALUES (1,26,3,1,NULL);
         INSERT INTO pokemon VALUES (6,'charizard',6,17,905,240,8,1);
         INSERT INTO pokemon_species
             (id,identifier,generation_id,evolves_from_species_id,
@@ -115,6 +116,24 @@ def test_v_pokemon_second_type(conn):
     row = conn.execute("SELECT * FROM v_pokemon WHERE id = 6").fetchone()
     assert row["type1"] == "Fire"
     assert row["type2"] == "Flying"
+
+
+def test_v_evolution_collapses_duplicate_version_groups(conn):
+    # Same Pikachu -> Raichu evolution repeated for a second version group (as PokeAPI
+    # does per-game), only one of which is flagged is_default. v_evolution should
+    # surface exactly one row per real evolution, not one per version group.
+    conn.execute(
+        """
+        INSERT INTO pokemon_evolution
+            (id,evolved_species_id,evolution_trigger_id,version_group_id,is_default,minimum_level)
+            VALUES (2,26,3,2,0,NULL)
+        """
+    )
+    conn.commit()
+    rows = conn.execute(
+        "SELECT * FROM v_evolution WHERE from_name = 'Pikachu' AND to_name = 'Raichu'"
+    ).fetchall()
+    assert len(rows) == 1
 
 
 def test_v_pokemon_moves_returns_distinct_rows(conn):

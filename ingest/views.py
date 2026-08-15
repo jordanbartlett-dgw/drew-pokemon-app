@@ -71,20 +71,32 @@ VIEWS: dict[str, str] = {
     """,
     "v_evolution": """
         CREATE VIEW v_evolution AS
-        SELECT
-            child.evolution_chain_id AS chain_id,
-            COALESCE(pn.name, parent.identifier) AS from_name,
-            COALESCE(cn.name, child.identifier)  AS to_name,
-            tr.identifier                        AS trigger,
-            ev.minimum_level                     AS min_level
-        FROM pokemon_evolution ev
-        JOIN pokemon_species child ON child.id = ev.evolved_species_id
-        JOIN pokemon_species parent ON parent.id = child.evolves_from_species_id
-        LEFT JOIN evolution_triggers tr ON tr.id = ev.evolution_trigger_id
-        LEFT JOIN pokemon_species_names cn
-               ON cn.pokemon_species_id = child.id AND cn.local_language_id = 9
-        LEFT JOIN pokemon_species_names pn
-               ON pn.pokemon_species_id = parent.id AND pn.local_language_id = 9
+        SELECT chain_id, from_name, to_name, trigger, min_level FROM (
+            SELECT
+                child.evolution_chain_id AS chain_id,
+                COALESCE(pn.name, parent.identifier) AS from_name,
+                COALESCE(cn.name, child.identifier)  AS to_name,
+                tr.identifier                        AS trigger,
+                ev.minimum_level                     AS min_level,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ev.evolved_species_id ORDER BY ev.id
+                ) AS rn
+            FROM pokemon_evolution ev
+            JOIN pokemon_species child ON child.id = ev.evolved_species_id
+            JOIN pokemon_species parent ON parent.id = child.evolves_from_species_id
+            LEFT JOIN evolution_triggers tr ON tr.id = ev.evolution_trigger_id
+            LEFT JOIN pokemon_species_names cn
+                   ON cn.pokemon_species_id = child.id AND cn.local_language_id = 9
+            LEFT JOIN pokemon_species_names pn
+                   ON pn.pokemon_species_id = parent.id AND pn.local_language_id = 9
+            -- pokemon_evolution has one row per game version group that shares the
+            -- same evolution; is_default marks the canonical row per game, but
+            -- regional-form species (e.g. Alolan Meowth) can still leave more than
+            -- one is_default row for the same evolved species, each with a
+            -- different trigger/level. rn = 1 collapses that down to exactly one
+            -- row per real evolution, which is what a species-level chain needs.
+            WHERE ev.is_default = 1
+        ) WHERE rn = 1
     """,
     "v_pokemon_moves": """
         CREATE VIEW v_pokemon_moves AS
