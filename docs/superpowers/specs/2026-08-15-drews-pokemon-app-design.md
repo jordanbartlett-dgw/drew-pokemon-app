@@ -94,6 +94,11 @@ The command is idempotent. Rerunning produces the same database.
 6. Sparse-clone `PokeAPI/sprites` for `sprites/pokemon/other/official-artwork/`
    and `sprites/pokemon/*.png` into `data/images/`. Roughly 400MB and several
    minutes. Skipped by `--skip-images`.
+   (Correction, post-Task-22-review: the real measured size is **171MB**
+   across **2,680 files**, per `du -sh data/images` on the actual checkout,
+   confirmed in Task 7's report and reproduced independently in review. The
+   400MB figure above was an unverified estimate in the original plan;
+   left here as the historical draft, corrected in `README.md`.)
 
 ### Verification
 
@@ -257,6 +262,8 @@ known rate so the cap never silently over-spends.
 
 - The sprites clone is ~400MB and is the slowest part of setup. `--skip-images`
   exists so the rest can be built and tested without it.
+  (Correction, post-Task-22-review: measured 171MB / 2,680 files, not
+  ~400MB — see the same correction in the Ingest section above.)
 - Generated SQL quality is the main quality risk. Mitigated by the denormalized
   views, the schema in the system prompt, and errors being returned to the model
   for retry.

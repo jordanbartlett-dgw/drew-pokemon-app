@@ -8,7 +8,7 @@ Runs entirely on this machine apart from the OpenAI calls.
 ```bash
 infisical init              # once, link this folder to the drew-pokemon project
 uv sync
-uv run python -m ingest.sync    # ~10 minutes, downloads ~400MB of artwork
+uv run python -m ingest.sync    # downloads ~171MB of artwork (2,680 files); takes a few minutes, longer on a slow connection
 cd web && npm install
 ```
 

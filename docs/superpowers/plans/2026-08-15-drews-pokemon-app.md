@@ -5471,7 +5471,7 @@ Expected: `200`. Disconnect from the internet and reload a conversation. The art
 
 - [x] **Step 5: Write `README.md`**
 
-The shipped `README.md` corrects two things that had drifted from this
+The shipped `README.md` corrects several things that had drifted from this
 plan's draft: `fastapi dev` is never mentioned (it needs `fastapi[standard]`,
 not a dependency; `uv run uvicorn` is the only supported entry point, per
 the `672e061` commit), and the Minisforum section calls out the Infisical
@@ -5479,6 +5479,16 @@ machine identity `deploy/install.sh` requires. The cost figure below was
 also corrected against measured numbers (see the Step 6 commit's
 verification report): real questions cost $0.0004-$0.0012 depending on tool
 call count, not a flat $0.0012.
+
+**Correction (post-review, Task 22 fix pass):** the `~400MB of artwork` and
+`~10 minutes` figures in the setup snippet below are wrong and unmeasured,
+respectively. `du -sh data/images` on the real checkout measures **171MB**
+across **2,680 files** (this matches the `du` Task 7's own report ran, and
+was reproduced independently in review). "~10 minutes" was never timed by
+anyone; the shipped `README.md` now says "a few minutes, longer on a slow
+connection" instead of a precise-sounding invented number. Left as-is below
+since this plan is a historical record of what was drafted, not what
+shipped.
 
 ````markdown
 # Drew's Pokémon App
