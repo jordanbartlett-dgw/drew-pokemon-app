@@ -17,6 +17,33 @@ The OpenAI key lives in Infisical, project `drew-pokemon`. There is no `.env` fi
 `ingest.sync` builds `data/pokedex.db` from PokeAPI's own CSV dump and copies
 artwork into `data/images/`. Pass `--skip-images` to skip the slow part.
 
+### Two databases
+
+- `data/pokedex.db` — the Pokédex. Read-only at runtime, rebuilt from scratch by
+  `ingest.sync` every time (`build_database` deletes and recreates the file).
+  Disposable: re-running the ingest to refresh Pokémon data is always safe.
+- `data/app.db` — Drew's own data: conversations and the daily `usage_log` spend
+  ledger. `ingest.sync` never touches this file. It is created automatically the
+  first time the app runs; there is nothing to set up.
+
+If you have an older `data/pokedex.db` from before this split that still has
+`conversations`, `turns`, or `usage_log` rows in it, run the app once (so
+`data/app.db` exists with its schema applied) then copy those three tables across:
+
+```bash
+uv run python3 -c "
+import sqlite3
+new = sqlite3.connect('data/app.db')
+new.execute(\"ATTACH DATABASE 'data/pokedex.db' AS old_db\")
+for table in ('conversations', 'turns', 'usage_log'):
+    new.execute(f'INSERT INTO {table} SELECT * FROM old_db.{table}')
+new.commit()
+"
+```
+
+If you'd rather not bother, it's also fine to accept that early conversations are
+lost — nothing else depends on them.
+
 ## Running
 
 Development, two processes:
@@ -32,7 +59,23 @@ Do not use `fastapi dev`; it requires `fastapi[standard]`, which is not a
 dependency of this project. `uv run uvicorn ...` is the supported entry point.
 
 On the Minisforum it runs as a single process under systemd, published to the
-tailnet:
+tailnet. Before the first `install.sh` run, create the env file the unit
+requires (`deploy/drews-pokemon-app.service`'s `EnvironmentFile`, no leading
+`-`, so systemd refuses to start without it):
+
+```bash
+cat > ~/.config/drews-pokemon-app.env <<'EOF'
+INFISICAL_TOKEN=<machine identity client secret, from the Infisical dashboard>
+INFISICAL_PROJECT_ID=<the drew-pokemon project's ID, from its Infisical URL/settings>
+EOF
+chmod 600 ~/.config/drews-pokemon-app.env
+```
+
+`INFISICAL_TOKEN` comes from an Infisical machine identity (Organization
+Settings → Machine Identities), scoped to the `drew-pokemon` project;
+`INFISICAL_PROJECT_ID` is that project's ID, visible in its Infisical URL or
+Project Settings. Both are secrets — `chmod 600` keeps them readable only by
+this user. `install.sh` checks the file exists before doing anything else.
 
 ```bash
 ./deploy/install.sh
@@ -41,12 +84,12 @@ tailscale serve status
 ```
 
 `install.sh` builds the frontend into `web/build`, installs the user systemd
-unit, and publishes port 8000 over Tailscale HTTPS. It needs an Infisical
-machine identity configured on the Minisforum (`infisical run --` in the unit
-authenticates as that identity, not as a logged-in user) and `sudo` for
-`tailscale serve`. Both are things only Jordan sets up; the script preflights
-that the `infisical` and `uv` binary paths in the unit still match what's on
-`PATH` before touching anything.
+unit, and publishes port 8000 over Tailscale HTTPS. It needs the env file
+above, an Infisical machine identity configured on the Minisforum (`infisical
+run --` in the unit authenticates as that identity, not as a logged-in user),
+and `sudo` for `tailscale serve`. These are things only Jordan sets up; the
+script preflights that the env file exists and that the `infisical` and `uv`
+binary paths in the unit still match what's on `PATH` before touching anything.
 
 Drew opens `https://<host>.<tailnet>.ts.net` on his iPad. The app binds to
 `127.0.0.1` only; Tailscale is the only way in.
@@ -59,7 +102,8 @@ The model never answers from memory. It has five tools over the local database:
 Pokémon cards from the typed tool results rather than from the model's prose, so
 the numbers on screen are always the numbers in the database.
 
-Conversations are stored in the same SQLite file as the Pokédex.
+Conversations and the daily usage log live in `data/app.db`, a file the Pokédex
+ingest never touches -- see "Two databases" above.
 
 ## Tests
 
@@ -76,9 +120,11 @@ Tests never call OpenAI. `ALLOW_MODEL_REQUESTS` is off and the agent runs agains
 Two independent limits.
 
 Per question, `UsageLimits(request_limit=8, tool_calls_limit=12,
-total_tokens_limit=20000)` stops a runaway tool loop. Per day, every turn's
-tokens are priced and logged to `usage_log`, and the app refuses past
-`$0.25` with a friendly message. The cap resets at local midnight.
+total_tokens_limit=60000)` stops a runaway tool loop -- 60k tokens is about
+$0.07 worst case, well under a single day's cap; the $0.25/day cap below is the
+real money control. Per day, every turn's tokens are priced and logged to
+`usage_log`, and the app refuses past `$0.25` with a friendly message. The cap
+resets at local midnight.
 
 At `openai:gpt-5.6-luna` prices ($0.20 / $1.20 per million input/output
 tokens) a real question costs roughly $0.0004-$0.0012 depending on how many
@@ -99,7 +145,8 @@ Secrets come from Infisical, injected by `infisical run --`.
 |---|---|---|
 | `OPENAI_API_KEY` | none, required | Your OpenAI key |
 | `POKEDEX_OPENAI_MODEL` | `openai:gpt-5.6-luna` | Model, with the provider prefix |
+| `POKEDEX_STORE_PATH` | `data/app.db` | Conversations and the daily usage log |
 | `POKEDEX_DAILY_BUDGET_USD` | `0.25` | Daily spend cap |
 | `POKEDEX_REQUEST_LIMIT` | `8` | Model turns per question |
 | `POKEDEX_TOOL_CALLS_LIMIT` | `12` | Tool calls per question |
-| `POKEDEX_TOTAL_TOKENS_LIMIT` | `20000` | Tokens per question |
+| `POKEDEX_TOTAL_TOKENS_LIMIT` | `60000` | Tokens per question |

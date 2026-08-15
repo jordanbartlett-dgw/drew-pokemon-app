@@ -17,6 +17,17 @@ echo "Checking the systemd unit's binary paths..."
 infisical_unit_path="$(grep -oE '%h\S*infisical' "$UNIT_FILE" | head -1 | sed "s|%h|$HOME|")"
 uv_unit_path="$(grep -oE '%h\S*/uv\b' "$UNIT_FILE" | head -1 | sed "s|%h|$HOME|")"
 
+# The unit's EnvironmentFile has no leading '-', so systemd refuses to even start
+# without it -- and ${INFISICAL_PROJECT_ID} in ExecStart comes from it. Catching a
+# missing file here beats a service that fails at boot with no obvious cause.
+env_file="$HOME/.config/drews-pokemon-app.env"
+if [[ ! -f "$env_file" ]]; then
+	echo "ERROR: $env_file does not exist." >&2
+	echo "       The service will refuse to start without it. See the README's" >&2
+	echo "       deploy section for what it must contain, then re-run this script." >&2
+	exit 1
+fi
+
 if [[ -z "$infisical_unit_path" || -z "$uv_unit_path" ]]; then
 	echo "ERROR: could not find both an infisical and a uv path in $UNIT_FILE's ExecStart." >&2
 	echo "       Check the ExecStart line hasn't drifted from the expected format." >&2
