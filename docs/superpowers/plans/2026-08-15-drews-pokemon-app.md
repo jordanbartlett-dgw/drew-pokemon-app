@@ -3980,6 +3980,8 @@ git commit -m "feat: SvelteKit scaffold with Tailwind v4 and shared types"
   - `api.ts`: `listConversations()`, `loadConversation(id)`, `deleteConversation(id)`.
   - `chat.svelte.ts`: `createChat()` returning `{ messages, busy, error, conversationId, send(text), reset(), load(id) }` where `messages: ChatMessage[]` and `ChatMessage = { role: 'user' | 'assistant'; text: string; toolEvents: ToolEvent[] }`.
 
+> **Amendment (2026-08-15, found in review).** The Step 8 code below is silently broken in a real component. It pushes the `assistant` object into the `$state` array and then mutates that detached local reference. Svelte 5 deep-proxies `$state` array contents, so `push()` stores a *proxy wrapping* the object and only writes through the array element hit the `set` trap. A component reading `.text` when the message is pushed — while it is still empty — caches the signal, and every streamed token afterwards is dropped: a permanently blank assistant bubble while the backend streams correctly. Unit tests do not catch it, because reading `.text` only after `send()` resolves falls through the proxy's `get` trap to the raw object. As shipped, every mutation re-reads `messages[assistantIndex]`, and a reactivity test using `$effect.root` + `flushSync` subscribes *before* tokens arrive; it was confirmed to fail against the old code. `reset()` also now aborts the in-flight stream via a per-send `AbortController`, clears `busy`, and leaves `error` null. Implemented in `944247e`.
+
 - [ ] **Step 1: Write the failing test for the frame parser**
 
 `web/src/lib/sse.test.ts`:
