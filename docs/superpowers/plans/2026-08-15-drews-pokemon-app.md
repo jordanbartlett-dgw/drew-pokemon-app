@@ -3079,6 +3079,12 @@ git commit -m "feat: token pricing and daily budget cap"
 
 Tool arguments arrive on `FunctionToolCallEvent` and results on `FunctionToolResultEvent`, matched by `tool_call_id`. A `ModelRetry` surfaces as a retry-prompt part rather than a tool return, and is not emitted to the UI.
 
+> **Amendment (2026-08-15, found by real execution).** Two corrections to the Step 3 code below, both verified on pydantic-ai 2.31.0.
+> 1. **The first chunk of streamed text arrives as `PartStartEvent`, not `PartDeltaEvent`.** Handling deltas only silently drops the opening words of every answer. Both event types must contribute to the token stream and to `recorder.text`, with the first chunk counted exactly once. Confirmed by disabling the fix and watching the first chunk vanish.
+> 2. **The `except UsageLimitExceeded` and `except Exception` blocks must record tokens.** As written they left `recorder.input_tokens`/`output_tokens` at zero, so a runaway tool loop — the most expensive turn the app can produce, and the exact case the budget exists to stop — billed nothing against the daily cap. Both blocks now read `events.usage` off the `run_stream_events()` handle before yielding their frame. Tests assert non-zero tokens on both paths.
+>
+> Implemented in `863eccc` and `6832178`.
+
 - [ ] **Step 1: Write the failing test**
 
 `tests/api/test_sse.py`:
