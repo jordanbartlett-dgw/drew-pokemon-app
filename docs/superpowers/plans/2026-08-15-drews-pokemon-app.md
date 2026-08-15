@@ -3336,6 +3336,8 @@ Routes:
 
 Two cost behaviours live here. Before a turn starts, if today's spend is at the cap the app emits a `limit` frame with `BUDGET_MESSAGE` and never calls the model. After a turn ends, the recorded token counts are priced and logged, including the tokens burned by a turn that hit `UsageLimitExceeded`.
 
+> **Amendment (2026-08-15, found in review).** Persistence must also run when the client disconnects mid-stream. Drew closing the iPad tab raises `ClientDisconnect` outside the generator, and the abandoned generator is closed with `GeneratorExit` — a `BaseException` that no `except Exception` catches — so OpenAI bills tokens that never reach `usage_log` or `turns`, and the daily cap silently under-counts. As shipped: `stream_turn` captures partial usage on unwind behind a `settled` flag (never yielding during `GeneratorExit`), and the route holds the generator and explicitly `await turn.aclose()`s it in a `finally` before persisting — an abandoned `async for` does NOT propagate closure into the generator it iterates. The `save_turn` gate was widened to persist partial turns but still writes nothing for a turn abandoned before any text or tool event. Persistence failures now end with an `error` frame instead of an abrupt close. Implemented in `54d3121`.
+
 - [ ] **Step 1: Write the failing test**
 
 `tests/api/test_routes.py`:
