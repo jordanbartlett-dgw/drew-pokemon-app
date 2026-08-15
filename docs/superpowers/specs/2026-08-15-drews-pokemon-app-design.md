@@ -37,7 +37,7 @@ pokemon_app/
   docs/
 ```
 
-Development runs two processes: `uv run fastapi dev` on :8000 and
+Development runs two processes: `uv run uvicorn api.app:app` on :8000 and
 `npm run dev` on :5173, with Vite proxying `/api` and `/images` to :8000.
 In production there is one process: FastAPI serves the built frontend, the API,
 and the images together. See Deployment below.
