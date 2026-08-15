@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
@@ -38,3 +39,28 @@ def test_connection_rejects_writes(db_path):
 def test_open_read_only_raises_when_missing(tmp_path):
     with pytest.raises(FileNotFoundError):
         open_read_only(tmp_path / "nope.db")
+
+
+def test_concurrent_queries_are_serialized(db_path):
+    """Verify that concurrent query() calls on a shared connection are safe.
+
+    This test runs 8 threads, each executing 50 queries concurrently. Without
+    the module-level lock in query(), SQLite would raise ProgrammingError or
+    return inconsistent results under concurrent load.
+    """
+    conn = open_read_only(db_path)
+    expected = [{"id": 25, "name": "Pikachu"}]
+    results = []
+
+    def worker():
+        for _ in range(50):
+            result = query(conn, "SELECT * FROM v_pokemon")
+            results.append(result)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker) for _ in range(8)]
+        for future in as_completed(futures):
+            future.result()
+
+    assert len(results) == 400
+    assert all(r == expected for r in results)
