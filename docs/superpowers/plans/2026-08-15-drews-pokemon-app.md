@@ -394,7 +394,7 @@ git commit -m "feat: sparse clone of PokeAPI source repos"
 - Consumes: nothing
 - Produces: `ingest.schema.TABLES: dict[str, str]` mapping table name to its `CREATE TABLE` SQL, and `apply_schema(conn: sqlite3.Connection) -> None`.
 
-The 26 source tables and their columns are fixed by the CSVs. Column names below were read from the live CSV headers and must match exactly.
+The 28 source tables and their columns are fixed by the CSVs. Column names below were read from the live CSV headers and must match exactly.
 
 - [ ] **Step 1: Write the failing test**
 
