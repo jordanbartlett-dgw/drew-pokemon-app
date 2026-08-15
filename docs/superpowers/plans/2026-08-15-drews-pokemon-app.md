@@ -86,7 +86,7 @@ uv add --dev pytest anyio ruff httpx
 
 - [ ] **Step 2: Verify the OpenAI model id before hardcoding a default**
 
-The default is `openai:gpt-5.6-luna`, chosen for price ($0.20 per 1M input, $1.20 per 1M output). Confirm that model exists on this account, and if not pick the newest available and use it as the default:
+The default is `openai:gpt-5.6-luna`, chosen for price ($0.20 per 1M input, $1.20 per 1M output). Confirmed present on Jordan's account on 2026-08-15. Re-confirm it exists, and if not pick the newest available and use it as the default:
 
 ```bash
 infisical run -- bash -c 'curl -s https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"' \
