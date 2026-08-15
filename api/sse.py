@@ -52,6 +52,7 @@ async def stream_turn(
     pending_args: dict[str, dict[str, Any]] = {}
     chunks: list[str] = []
     events = None
+    settled = False
 
     try:
         async with agent.run_stream_events(
@@ -92,14 +93,28 @@ async def stream_turn(
                     recorder.text = "".join(chunks) or str(event.result.output)
                     recorder.input_tokens = event.result.usage.input_tokens
                     recorder.output_tokens = event.result.usage.output_tokens
+            settled = True
     except UsageLimitExceeded:
         recorder.text = "".join(chunks) or LIMIT_MESSAGE
         _record_usage_so_far(recorder, events)
+        settled = True
         yield frame("limit", {"message": LIMIT_MESSAGE})
     except Exception as exc:  # noqa: BLE001 - surfaced to the browser, not swallowed
         recorder.text = "".join(chunks)
         _record_usage_so_far(recorder, events)
+        settled = True
         yield frame("error", {"message": f"{type(exc).__name__}: {exc}"})
+    finally:
+        if not settled:
+            # The caller abandoned this generator mid-turn (a `GeneratorExit` from a
+            # client disconnect, or a `CancelledError` from the surrounding task) —
+            # neither is caught by `except Exception` above, and both land here
+            # without ever reaching `AgentRunResultEvent`. Never yield in this
+            # branch: yielding during that unwind raises RuntimeError. Whatever text
+            # and tool calls happened are already on `recorder`; still bill whatever
+            # tokens the model already burned before the caller walked away.
+            recorder.text = recorder.text or "".join(chunks)
+            _record_usage_so_far(recorder, events)
 
 
 def _record_usage_so_far(recorder: TurnRecorder, events: Any) -> None:

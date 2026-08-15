@@ -113,24 +113,65 @@ def create_app(
 
             recorder = TurnRecorder()
             history = load_history(store_conn, conversation_id)
-            async for chunk in stream_turn(
+            persisted = False
+            persist_error: str | None = None
+
+            def persist() -> None:
+                # Runs exactly once, on the happy path AND on an abandoned generator.
+                # A client disconnect surfaces here as GeneratorExit thrown at the
+                # `yield chunk` below; `finally` still runs on that unwind, so a turn
+                # the model already finished (and OpenAI already billed) is not lost.
+                # record_usage/save_turn are plain sqlite calls, safe to run mid-unwind.
+                nonlocal persisted, persist_error
+                if persisted:
+                    return
+                persisted = True
+                try:
+                    if recorder.input_tokens or recorder.output_tokens:
+                        record_usage(
+                            store_conn, model_id, recorder.input_tokens, recorder.output_tokens
+                        )
+                    if recorder.new_messages or recorder.tool_events or recorder.text:
+                        # `new_messages` is only set when the run finished cleanly;
+                        # an abandoned turn (disconnect) still has whatever tool
+                        # calls or partial text happened, and that is worth saving
+                        # to Drew's history even without a full message history for
+                        # conversation continuity. `save_turn` accepts an empty
+                        # `new_messages` list for that case.
+                        save_turn(
+                            store_conn,
+                            conversation_id,
+                            message,
+                            recorder.text,
+                            recorder.tool_events,
+                            recorder.new_messages,
+                        )
+                except Exception as exc:  # noqa: BLE001 - reported via a terminal frame below
+                    persist_error = f"{type(exc).__name__}: {exc}"
+
+            turn = stream_turn(
                 agent, PokedexDeps(conn=read_conn), message, history, recorder, usage_limits
-            ):
-                yield chunk
+            )
+            try:
+                async for chunk in turn:
+                    yield chunk
+            finally:
+                # Never yield in here: yielding during GeneratorExit unwind (the
+                # disconnect case) raises RuntimeError because the connection is gone.
+                #
+                # On the happy path `turn` is already exhausted, so this is a no-op.
+                # On a disconnect, `body()` is closed via GeneratorExit at the `yield
+                # chunk` above, but `async for` does not itself propagate that into
+                # `turn` — it just abandons it. Closing it explicitly is what lets
+                # `stream_turn`'s own unwind handling (api/sse.py) capture whatever
+                # tokens were burned before the client walked away.
+                await turn.aclose()
+                persist()
 
-            if recorder.input_tokens or recorder.output_tokens:
-                record_usage(store_conn, model_id, recorder.input_tokens, recorder.output_tokens)
-
-            if recorder.new_messages:
-                save_turn(
-                    store_conn,
-                    conversation_id,
-                    message,
-                    recorder.text,
-                    recorder.tool_events,
-                    recorder.new_messages,
-                )
-            yield frame("done", {"conversation_id": conversation_id})
+            if persist_error is not None:
+                yield frame("error", {"message": persist_error})
+            else:
+                yield frame("done", {"conversation_id": conversation_id})
 
         return StreamingResponse(
             body(),

@@ -9,8 +9,8 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from api.budget import ensure_schema as ensure_budget_schema
 from api.budget import record_usage
-from api.main import create_app
-from api.store import open_store
+from api.main import ChatRequest, create_app
+from api.store import load_turns, open_store
 
 pytestmark = pytest.mark.anyio
 
@@ -166,3 +166,62 @@ async def test_usage_is_recorded_after_a_turn(client, pokedex_path):
         await client.post("/api/chat", json={"message": "Who is Pikachu?"})
         body = (await client.get("/api/health")).json()
     assert body["spent_today_usd"] > 0
+
+
+async def test_happy_path_bills_exactly_one_usage_row(client, pokedex_path):
+    async with client:
+        await client.post("/api/chat", json={"message": "Who is Pikachu?"})
+    store = open_store(pokedex_path)
+    rows = store.execute("SELECT COUNT(*) AS n FROM usage_log").fetchone()
+    assert rows["n"] == 1
+
+
+async def test_disconnect_mid_turn_still_bills_and_persists(pokedex_path, tmp_path):
+    """Simulate a client (Drew's iPad) walking away mid-answer.
+
+    `httpx.ASGITransport` cannot express a genuine mid-stream disconnect: its
+    `handle_async_request` awaits the whole ASGI app call to completion before
+    building a `Response` at all (see `httpx._transports.asgi.ASGITransport`),
+    so consuming a few lines and closing the stream never actually interrupts
+    the server-side generator — the turn always finishes first. Cancelling the
+    outer asyncio task is not deterministic either: on this ASGI spec version
+    Starlette's `StreamingResponse.__call__` runs `stream_response` inside a
+    separate task group, so the timing of when cancellation reaches `body()`
+    depends on anyio internals, not on this test.
+
+    The deterministic equivalent used here: call the `/api/chat` route's
+    endpoint function directly (a plain Python function call, no ASGI
+    machinery) to get the `StreamingResponse` it builds, pull a couple of real
+    frames from its `body_iterator` (the app's `body()` async generator), then
+    `.aclose()` it mid-turn. That is exactly the `GeneratorExit` Starlette
+    throws into an abandoned response body when a real client disconnects.
+    """
+    app = create_app(
+        db_path=pokedex_path,
+        images_dir=tmp_path,
+        model=FunctionModel(_script, stream_function=_stream_script),
+    )
+    route = next(r for r in app.routes if getattr(r, "path", None) == "/api/chat")
+    chat = route.endpoint
+
+    response = chat(ChatRequest(message="Who is Pikachu?"))
+    gen = response.body_iterator
+
+    start_frame = await gen.__anext__()
+    conversation_id = json.loads(start_frame.split("\n")[1].removeprefix("data: "))[
+        "conversation_id"
+    ]
+    tool_frame = await gen.__anext__()
+    assert tool_frame.startswith("event: tool")
+
+    # Walk away before the model's final answer streams back or completes.
+    await gen.aclose()
+
+    store = open_store(pokedex_path)
+    usage_rows = store.execute("SELECT * FROM usage_log").fetchall()
+    assert len(usage_rows) == 1
+    assert usage_rows[0]["input_tokens"] > 0
+
+    turns = load_turns(store, conversation_id)
+    assert len(turns) == 1
+    assert turns[0].tool_events[0].tool_name == "find_pokemon"
