@@ -30,10 +30,11 @@
 
 ```
 pyproject.toml              uv project, deps, ruff + pytest config
-.env.example                OPENAI_API_KEY, POKEDEX_OPENAI_MODEL
+.infisical.json             links this folder to the drew-pokemon project (committed)
 .gitignore                  data/, .env, node_modules, __pycache__
 
 api/settings.py             Settings (pydantic-settings) + get_settings()
+api/app.py                  the ASGI entry point the dev server loads
 api/db.py                   read-only SQLite connections, query()
 api/models.py               all Pydantic domain models
 api/sql_guard.py            validate_sql(): SELECT-only, LIMIT enforcement
