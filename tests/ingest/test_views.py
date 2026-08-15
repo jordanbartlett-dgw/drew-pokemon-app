@@ -136,6 +136,48 @@ def test_v_evolution_collapses_duplicate_version_groups(conn):
     assert len(rows) == 1
 
 
+def test_v_evolution_breaks_ties_by_lowest_id_when_both_are_default(conn):
+    # This is the defect the ROW_NUMBER() fix actually targets: two rows for the same
+    # evolved_species_id BOTH marked is_default=1 (the real Sandshrew->Sandslash case
+    # has exactly this shape: id 18 level-up, id 448 use-item, both default). A plain
+    # `WHERE is_default = 1` filter alone would leave both rows and regress to the
+    # 19-rows-for-Eevee bug; ROW_NUMBER() must pick exactly one, and it must be the
+    # lower-id row (id 100 here), carrying that row's trigger/min_level, not id 101's.
+    # Uses a fresh species pair (not Pikachu/Raichu) so the existing id=1 evolution row
+    # in the shared fixture can't win the tiebreak by accident.
+    conn.execute("INSERT INTO evolution_triggers VALUES (1,'level-up')")
+    conn.execute(
+        "INSERT INTO pokemon_species (id,identifier,generation_id,evolution_chain_id) "
+        "VALUES (900,'testmon',1,900)"
+    )
+    conn.execute(
+        "INSERT INTO pokemon_species "
+        "(id,identifier,generation_id,evolves_from_species_id,evolution_chain_id) "
+        "VALUES (901,'bestmon',1,900,900)"
+    )
+    conn.execute(
+        """
+        INSERT INTO pokemon_evolution
+            (id,evolved_species_id,evolution_trigger_id,version_group_id,is_default,minimum_level)
+            VALUES (100,901,1,3,1,45)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO pokemon_evolution
+            (id,evolved_species_id,evolution_trigger_id,version_group_id,is_default,minimum_level)
+            VALUES (101,901,3,4,1,NULL)
+        """
+    )
+    conn.commit()
+    rows = conn.execute(
+        "SELECT * FROM v_evolution WHERE from_name = 'testmon' AND to_name = 'bestmon'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["trigger"] == "level-up"
+    assert rows[0]["min_level"] == 45
+
+
 def test_v_pokemon_moves_returns_distinct_rows(conn):
     rows = conn.execute(
         "SELECT * FROM v_pokemon_moves WHERE pokemon = 'Pikachu' AND move = 'Thunderbolt'"

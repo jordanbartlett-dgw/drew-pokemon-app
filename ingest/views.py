@@ -78,6 +78,13 @@ VIEWS: dict[str, str] = {
                 COALESCE(cn.name, child.identifier)  AS to_name,
                 tr.identifier                        AS trigger,
                 ev.minimum_level                     AS min_level,
+                -- ORDER BY ev.id is a best-effort tiebreaker, not a documented API
+                -- guarantee: it relies on PokeAPI listing a species' base-form
+                -- evolution row (lower id) before its regional-variant rows (higher
+                -- id) in the source CSV. verify()'s duplicate-triple check on
+                -- v_evolution is the safety net for this view collapsing back to
+                -- more than one row per species if that assumption ever breaks; it
+                -- does not, on its own, confirm which row won a tie.
                 ROW_NUMBER() OVER (
                     PARTITION BY ev.evolved_species_id ORDER BY ev.id
                 ) AS rn
