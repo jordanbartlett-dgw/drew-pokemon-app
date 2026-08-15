@@ -117,3 +117,31 @@ class SqlResult(BaseModel):
     rows: list[dict[str, Any]]
     row_count: int
     truncated: bool
+
+
+class ToolEvent(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tool_name: str
+    args: dict[str, Any] = {}
+    result: Any = None
+
+
+class StoredTurn(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    user_text: str
+    assistant_text: str
+    tool_events: list[ToolEvent] = []
+    created_at: str
+
+
+class ConversationSummary(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    title: str
+    created_at: str
+    updated_at: str
+    turn_count: int
