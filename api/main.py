@@ -3,12 +3,14 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import UsageLimits
 from pydantic_ai.models import Model
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api.agent import PokedexDeps, build_agent
 from api.budget import BUDGET_MESSAGE, is_over_budget, record_usage, spent_today
@@ -182,5 +184,15 @@ def create_app(
     # Mounted last, at the root, so it cannot shadow /api or /images.
     if web_dist is not None and web_dist.is_dir():
         app.mount("/", StaticFiles(directory=web_dist, html=True), name="web")
+
+        # adapter-static's SPA fallback file is index.html, but Starlette's
+        # StaticFiles(html=True) only auto-serves a literal 404.html (with a 404
+        # status) for unmatched paths. Drew's iPad can reload on any client-side
+        # route, so unmatched non-API/image paths get index.html with a 200 status.
+        @app.exception_handler(StarletteHTTPException)
+        async def spa_fallback(request: Request, exc: StarletteHTTPException) -> Response:
+            if exc.status_code == 404 and not request.url.path.startswith(("/api", "/images")):
+                return FileResponse(web_dist / "index.html")
+            return await http_exception_handler(request, exc)
 
     return app

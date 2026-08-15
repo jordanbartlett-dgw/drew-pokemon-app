@@ -1,0 +1,18 @@
+[Unit]
+Description=Drew's Pokémon App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Developer/drew/pokemon_app
+EnvironmentFile=%h/.config/drews-pokemon-app.env
+ExecStart=%h/.nvm/versions/node/v24.14.1/bin/infisical run --projectId=${INFISICAL_PROJECT_ID} --env=prod -- \
+    %h/.local/bin/uv run uvicorn api.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
