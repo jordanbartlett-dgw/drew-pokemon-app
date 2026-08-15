@@ -27,7 +27,27 @@ def frame(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-LIMIT_MESSAGE = "Whoa, that question sent me in circles! Try asking it a different way, Drew."
+CIRCLES_MESSAGE = "Whoa, that question sent me in circles! Try asking it a different way, Drew."
+TOO_LONG_MESSAGE = (
+    "This chat got too long for me to remember! Tap New question to start a fresh one."
+)
+
+
+def _limit_message(exc: UsageLimitExceeded) -> str:
+    """Pick the wording that matches what actually tripped.
+
+    `UsageLimitExceeded` (pydantic_ai.exceptions) carries no structured field for
+    which limit fired -- only a message string, built in pydantic_ai/usage.py, that
+    always names the limit (e.g. "Exceeded the total_tokens_limit of ..."). Matching
+    on that name is the best available signal without guessing: a request_limit or
+    tool_calls_limit trip means a genuine runaway tool loop, where rephrasing the
+    question can help; a total_tokens_limit trip means the accumulated conversation
+    history is too big to keep replaying, where rephrasing never helps and the real
+    fix is starting a new conversation.
+    """
+    if "total_tokens_limit" in str(exc):
+        return TOO_LONG_MESSAGE
+    return CIRCLES_MESSAGE
 
 
 @dataclass
@@ -94,11 +114,18 @@ async def stream_turn(
                     recorder.input_tokens = event.result.usage.input_tokens
                     recorder.output_tokens = event.result.usage.output_tokens
             settled = True
-    except UsageLimitExceeded:
-        recorder.text = "".join(chunks) or LIMIT_MESSAGE
+    except UsageLimitExceeded as exc:
+        message = _limit_message(exc)
+        partial = "".join(chunks)
+        # Persisted text matches what the client ends up showing: it appends this
+        # same `message` to whatever tokens already streamed (see
+        # web/src/lib/chat.svelte.ts's 'limit' handler), so reopening the
+        # conversation shows the same thing Drew saw live instead of a truncated
+        # half-answer with the limit sentence missing (Minor 9).
+        recorder.text = f"{partial} {message}".strip() if partial else message
         _record_usage_so_far(recorder, events)
         settled = True
-        yield frame("limit", {"message": LIMIT_MESSAGE})
+        yield frame("limit", {"message": message})
     except Exception as exc:  # noqa: BLE001 - surfaced to the browser, not swallowed
         recorder.text = "".join(chunks)
         _record_usage_so_far(recorder, events)

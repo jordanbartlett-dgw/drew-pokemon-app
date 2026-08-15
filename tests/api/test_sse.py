@@ -8,7 +8,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from api.agent import PokedexDeps, build_agent
-from api.sse import TurnRecorder, frame, stream_turn
+from api.sse import CIRCLES_MESSAGE, TOO_LONG_MESSAGE, TurnRecorder, frame, stream_turn
 
 pytestmark = pytest.mark.anyio
 
@@ -127,12 +127,48 @@ async def test_usage_limit_emits_a_limit_frame_not_an_error(pokedex):
     ]
     names = [name for name, _ in _parse(frames)]
     assert names[-1] == "limit"
-    assert "Drew" in _parse(frames)[-1][1]["message"]
+    # request_limit is a runaway-tool-loop cap, where rephrasing genuinely can help,
+    # so this must use CIRCLES_MESSAGE, not the total_tokens_limit wording.
+    assert _parse(frames)[-1][1]["message"] == CIRCLES_MESSAGE
     # Tokens burned before the limit tripped must still be billed against the daily
     # cap in api/budget.py — a runaway loop is the single most expensive turn the app
     # can produce, and it must not be the one turn that bills nothing.
     assert recorder.input_tokens > 0
     assert recorder.output_tokens > 0
+
+
+async def test_total_tokens_limit_uses_the_conversation_too_long_message(pokedex):
+    """Critical 1 part 4: total_tokens_limit means the accumulated history is too
+    big to keep replaying -- rephrasing the question can never help, unlike a
+    request_limit/tool_calls_limit trip, so it needs different wording."""
+
+    def loop(messages: list[ModelMessage], info: AgentInfo):
+        return ModelResponse(parts=[ToolCallPart("find_pokemon", {"name_or_id": "pikachu"})])
+
+    async def stream_loop(messages: list[ModelMessage], info: AgentInfo):
+        yield {
+            0: DeltaToolCall(
+                name="find_pokemon",
+                json_args=json.dumps({"name_or_id": "pikachu"}),
+                tool_call_id="call_1",
+            )
+        }
+
+    recorder = TurnRecorder()
+    agent = build_agent(FunctionModel(loop, stream_function=stream_loop))
+    frames = [
+        f
+        async for f in stream_turn(
+            agent,
+            PokedexDeps(conn=pokedex),
+            "a very long conversation",
+            [],
+            recorder,
+            UsageLimits(total_tokens_limit=1),
+        )
+    ]
+    assert _parse(frames)[-1][1]["message"] == TOO_LONG_MESSAGE
+    assert recorder.text == TOO_LONG_MESSAGE
 
 
 async def test_model_failure_emits_an_error_frame(pokedex):

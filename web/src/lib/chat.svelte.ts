@@ -49,8 +49,11 @@ export function createChat() {
 				} else if (event.name === 'tool') {
 					live.toolEvents.push(event.data);
 				} else if (event.name === 'limit') {
-					// Budget or loop cap. Drew sees a sentence, not an error banner.
-					live.text = event.data.message;
+					// Budget or loop cap. Drew sees a sentence, not an error banner. Append
+					// rather than replace so a partial answer that already streamed stays
+					// visible -- api/sse.py persists the same partial-plus-message text, so
+					// reopening the conversation later shows exactly what was live here.
+					live.text = live.text ? `${live.text} ${event.data.message}` : event.data.message;
 				} else if (event.name === 'error') {
 					error = event.data.message;
 				}
