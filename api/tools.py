@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import re
 import sqlite3
 from typing import Any
 
@@ -64,14 +65,14 @@ def _profile(conn: sqlite3.Connection, row: dict[str, Any]) -> PokemonProfile:
     )
 
 
-def load_profile(conn: sqlite3.Connection, pokemon_id: int) -> PokemonProfile | None:
-    rows = query(conn, "SELECT * FROM v_pokemon WHERE id = ?", (pokemon_id,))
-    return _profile(conn, rows[0]) if rows else None
-
-
 def find_pokemon(conn: sqlite3.Connection, name_or_id: str) -> FindPokemonResult:
     """Resolve a name, nickname-ish spelling, or number to one Pokémon."""
-    needle = name_or_id.strip().lower().replace(" ", "-")
+    # PokeAPI slugs drop punctuation entirely ('mr-mime', 'farfetchd', 'type-null'),
+    # but a kid typing "Mr. Mime", "Farfetch'd", or "Type: Null" includes it -- strip
+    # anything that isn't a letter, digit, space, or hyphen before swapping spaces for
+    # hyphens, so those still resolve on the exact-match path instead of falling
+    # through to a wasted model turn asking to disambiguate.
+    needle = re.sub(r"[^\w\s-]", "", name_or_id.strip().lower()).replace(" ", "-")
 
     rows = query(conn, "SELECT * FROM v_pokemon WHERE slug = ?", (needle,))
     if not rows:
