@@ -128,18 +128,40 @@ async def test_usage_limit_emits_a_limit_frame_not_an_error(pokedex):
     names = [name for name, _ in _parse(frames)]
     assert names[-1] == "limit"
     assert "Drew" in _parse(frames)[-1][1]["message"]
+    # Tokens burned before the limit tripped must still be billed against the daily
+    # cap in api/budget.py — a runaway loop is the single most expensive turn the app
+    # can produce, and it must not be the one turn that bills nothing.
+    assert recorder.input_tokens > 0
+    assert recorder.output_tokens > 0
 
 
 async def test_model_failure_emits_an_error_frame(pokedex):
+    # The crash happens on the *second* model call, after a real tool call already
+    # burned tokens, so a token assertion here actually exercises the "tokens spent
+    # before the crash are still recorded" behavior rather than trivially passing on
+    # a turn that never spent anything.
     def boom(messages: list[ModelMessage], info: AgentInfo):
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart("find_pokemon", {"name_or_id": "pikachu"})])
         raise RuntimeError("provider exploded")
 
     async def stream_boom(messages: list[ModelMessage], info: AgentInfo):
-        raise RuntimeError("provider exploded")
-        yield ""  # pragma: no cover - unreachable, makes this an async generator
+        if len(messages) == 1:
+            yield {
+                0: DeltaToolCall(
+                    name="find_pokemon",
+                    json_args=json.dumps({"name_or_id": "pikachu"}),
+                    tool_call_id="call_1",
+                )
+            }
+        else:
+            raise RuntimeError("provider exploded")
+            yield ""  # pragma: no cover - unreachable, makes this an async generator
 
     recorder = TurnRecorder()
     agent = build_agent(FunctionModel(boom, stream_function=stream_boom))
     frames = [f async for f in stream_turn(agent, PokedexDeps(conn=pokedex), "Who?", [], recorder)]
     names = [name for name, _ in _parse(frames)]
     assert names[-1] == "error"
+    assert recorder.input_tokens > 0
+    assert recorder.output_tokens > 0

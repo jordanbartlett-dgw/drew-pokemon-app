@@ -51,6 +51,7 @@ async def stream_turn(
 ) -> AsyncIterator[str]:
     pending_args: dict[str, dict[str, Any]] = {}
     chunks: list[str] = []
+    events = None
 
     try:
         async with agent.run_stream_events(
@@ -93,7 +94,27 @@ async def stream_turn(
                     recorder.output_tokens = event.result.usage.output_tokens
     except UsageLimitExceeded:
         recorder.text = "".join(chunks) or LIMIT_MESSAGE
+        _record_usage_so_far(recorder, events)
         yield frame("limit", {"message": LIMIT_MESSAGE})
     except Exception as exc:  # noqa: BLE001 - surfaced to the browser, not swallowed
         recorder.text = "".join(chunks)
+        _record_usage_so_far(recorder, events)
         yield frame("error", {"message": f"{type(exc).__name__}: {exc}"})
+
+
+def _record_usage_so_far(recorder: TurnRecorder, events: Any) -> None:
+    """Bill whatever the run spent before it errored out or hit the usage cap.
+
+    `events` (the `run_stream_events()` handle) exposes live `usage` once iteration has
+    started, even after the run has failed. A tool loop that trips the limit, or a request
+    that crashes mid-stream, still burned real tokens and must still count against the
+    daily budget in `api/budget.py` — leaving these at zero would make runaway turns free.
+    """
+    if events is None:
+        return
+    try:
+        usage = events.usage
+    except Exception:  # noqa: BLE001 - usage is best-effort here, never re-raise from a handler
+        return
+    recorder.input_tokens = usage.input_tokens
+    recorder.output_tokens = usage.output_tokens
