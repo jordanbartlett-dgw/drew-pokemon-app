@@ -14,6 +14,7 @@
 - `from __future__ import annotations` at the top of every Python file.
 - Type hints on every function. Pydantic `BaseModel` for all data crossing a boundary. `model_config = ConfigDict(...)`, never `class Config`.
 - Configuration via pydantic-settings. No hardcoded paths, keys, or model ids.
+- Secrets come from Infisical, project `drew-pokemon`, injected by the CLI. There is no `.env` file and no `.env.example`. Every command that needs the OpenAI key is prefixed with `infisical run --`. `.infisical.json` is committed; it holds the project id and default environment, not secrets.
 - Ruff for lint and format: `uv run ruff check --fix . && uv run ruff format .`
 - pydantic-ai v2 only. Model strings carry a provider prefix (`openai:...`). `result.usage` is a property. No `instrument=`, `history_processors=`, `prepare_tools=`, or `event_stream_handler=` constructor args.
 - Tests never call a live model. `models.ALLOW_MODEL_REQUESTS = False` in `tests/conftest.py`.
@@ -61,7 +62,8 @@ web/                        SvelteKit app (see Task 19 for internal layout)
 ### Task 1: Project scaffold and settings
 
 **Files:**
-- Create: `pyproject.toml`, `.gitignore`, `.env.example`, `api/__init__.py`, `api/settings.py`, `tests/__init__.py`, `tests/conftest.py`
+- Create: `pyproject.toml`, `.gitignore`, `api/__init__.py`, `api/settings.py`, `tests/__init__.py`, `tests/conftest.py`
+- Requires: `.infisical.json` linking this directory to the `drew-pokemon` project (Jordan runs `infisical init` once; see the note under Step 3)
 - Test: `tests/api/test_settings.py`
 
 **Interfaces:**
@@ -82,10 +84,25 @@ uv add --dev pytest anyio ruff httpx
 The default below is `openai:gpt-5.2`. Confirm that model exists on this account, and if not pick the newest available and use it as the default:
 
 ```bash
-curl -s https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY" | python3 -c "import json,sys; print([m['id'] for m in json.load(sys.stdin)['data'] if m['id'].startswith('gpt')])"
+infisical run -- bash -c 'curl -s https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"' \
+  | python3 -c "import json,sys; print([m['id'] for m in json.load(sys.stdin)['data'] if m['id'].startswith('gpt')])"
 ```
 
-- [ ] **Step 3: Write `.gitignore` and `.env.example`**
+If this returns an auth error, the secret in Infisical is not named `OPENAI_API_KEY`. Check the names without printing values:
+
+```bash
+infisical run -- printenv | cut -d= -f1 | sort
+```
+
+- [ ] **Step 3: Confirm Infisical is linked, then write `.gitignore`**
+
+`.infisical.json` must already exist in the project root, created by `infisical init` and pointing at the `drew-pokemon` project. That command is interactive, so Jordan runs it, not the implementer. Verify the link before going further:
+
+```bash
+infisical run -- printenv | grep -c OPENAI_API_KEY
+```
+
+Expected: `1`. If the file is missing you get `unknown flag` or a project-resolution error. Stop and ask Jordan to run `infisical init` rather than falling back to a `.env` file.
 
 `.gitignore`:
 
@@ -101,12 +118,7 @@ web/build/
 .pytest_cache/
 ```
 
-`.env.example`:
-
-```
-OPENAI_API_KEY=sk-replace-me
-POKEDEX_OPENAI_MODEL=openai:gpt-5.2
-```
+`.infisical.json` is deliberately not ignored. It carries the project id and default environment, no secrets.
 
 - [ ] **Step 4: Write the failing test**
 
@@ -154,9 +166,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime configuration for Drew's Pokémon App."""
+    """Runtime configuration. Secrets arrive from Infisical via `infisical run --`."""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore", populate_by_name=True)
 
     openai_api_key: SecretStr
     openai_model: str = "openai:gpt-5.2"
@@ -169,7 +181,7 @@ def get_settings() -> Settings:
     return Settings()
 ```
 
-Note: `openai_model` reads from `POKEDEX_OPENAI_MODEL` only if an `env_prefix` is set, which it is not. Add `alias="POKEDEX_OPENAI_MODEL"` via `Field` so the env var in `.env.example` works:
+Note: to let the model id come from a `POKEDEX_OPENAI_MODEL` secret rather than the field name, give it an alias:
 
 ```python
 from pydantic import Field, SecretStr
@@ -177,7 +189,7 @@ from pydantic import Field, SecretStr
     openai_model: str = Field(default="openai:gpt-5.2", alias="POKEDEX_OPENAI_MODEL")
 ```
 
-and set `populate_by_name=True` in `model_config`.
+`populate_by_name=True` is already set in `model_config` above, so the field name still works too. Setting `POKEDEX_OPENAI_MODEL` in Infisical is optional; the default applies when it is absent.
 
 - [ ] **Step 7: Add pytest and ruff config to `pyproject.toml`**
 
@@ -218,7 +230,7 @@ Expected: PASS, 2 passed
 - [ ] **Step 10: Commit**
 
 ```bash
-git add pyproject.toml uv.lock .gitignore .env.example api tests
+git add pyproject.toml uv.lock .gitignore .infisical.json api tests
 git commit -m "feat: project scaffold and settings"
 ```
 
@@ -2440,7 +2452,7 @@ Expected: PASS, 4 passed
 This is the first live OpenAI call. It costs a few cents.
 
 ```bash
-uv run python -c "
+infisical run -- uv run python -c "
 import asyncio
 from pathlib import Path
 from api.agent import PokedexDeps, build_agent
@@ -2962,12 +2974,14 @@ git commit -m "feat: map agent stream events to SSE frames"
 ### Task 16: FastAPI application
 
 **Files:**
-- Create: `api/main.py`
+- Create: `api/main.py`, `api/app.py`
 - Test: `tests/api/test_routes.py`
 
 **Interfaces:**
 - Consumes: everything in `api.*`
-- Produces: `api.main.create_app(db_path: Path, images_dir: Path, model: str | Model) -> FastAPI` and `api.main.app` (the default instance built from `get_settings()`).
+- Produces: `api.main.create_app(db_path: Path, images_dir: Path, model: str | Model) -> FastAPI`, and `api.app.app`, the default instance built from `get_settings()`.
+
+The two modules are separate on purpose. `api/main.py` holds only the factory, so importing it in tests needs neither an OpenAI key nor a built database. `api/app.py` is the entry point the dev server loads, and it does require both.
 
 Routes:
 
@@ -3208,9 +3222,20 @@ def create_app(db_path: Path, images_dir: Path, model: str | Model) -> FastAPI:
         )
 
     return app
+```
 
+Remove the now-unused `get_settings` import from `api/main.py`; it belongs to `api/app.py`.
+
+`api/app.py`:
+
+```python
+from __future__ import annotations
+
+from api.main import create_app
+from api.settings import get_settings
 
 settings = get_settings()
+
 app = create_app(
     db_path=settings.db_path,
     images_dir=settings.images_dir,
@@ -3231,7 +3256,7 @@ Expected: all green.
 - [ ] **Step 6: Start the server and check it by hand**
 
 ```bash
-uv run fastapi dev api/main.py --port 8000
+infisical run -- uv run fastapi dev api/app.py --port 8000
 ```
 
 In a second terminal:
@@ -3249,7 +3274,7 @@ Expected: a health payload with roughly 1,300 Pokémon; a live SSE stream with `
 
 ```bash
 uv run ruff check --fix . && uv run ruff format .
-git add api/main.py tests/api/test_routes.py
+git add api/main.py api/app.py tests/api/test_routes.py
 git commit -m "feat: FastAPI app with SSE chat and conversation routes"
 ```
 
@@ -4736,7 +4761,7 @@ git commit -m "feat: chat screen with sidebar and starter questions"
 Terminal one:
 
 ```bash
-uv run fastapi dev api/main.py --port 8000
+infisical run -- uv run fastapi dev api/app.py --port 8000
 ```
 
 Terminal two:
@@ -4781,11 +4806,13 @@ Runs entirely on this machine apart from the OpenAI calls.
 ## Setup
 
 ```bash
-cp .env.example .env        # add your OpenAI key
+infisical init              # once, link this folder to the drew-pokemon project
 uv sync
 uv run python -m ingest.sync    # ~10 minutes, downloads ~400MB of artwork
 cd web && npm install
 ```
+
+The OpenAI key lives in Infisical, project `drew-pokemon`. There is no `.env` file.
 
 `ingest.sync` builds `data/pokedex.db` from PokeAPI's own CSV dump and copies
 artwork into `data/images/`. Pass `--skip-images` to skip the slow part.
@@ -4793,7 +4820,7 @@ artwork into `data/images/`. Pass `--skip-images` to skip the slow part.
 ## Running
 
 ```bash
-uv run fastapi dev api/main.py --port 8000   # terminal one
+infisical run -- uv run fastapi dev api/app.py --port 8000   # terminal one
 cd web && npm run dev                        # terminal two
 ```
 
@@ -4821,10 +4848,12 @@ Tests never call OpenAI. `ALLOW_MODEL_REQUESTS` is off and the agent runs agains
 
 ## Configuration
 
-| Variable | Default | Meaning |
+Both come from Infisical, injected by `infisical run --`.
+
+| Secret | Default | Meaning |
 |---|---|---|
 | `OPENAI_API_KEY` | none, required | Your OpenAI key |
-| `POKEDEX_OPENAI_MODEL` | `openai:gpt-5.2` | Model, with the provider prefix |
+| `POKEDEX_OPENAI_MODEL` | `openai:gpt-5.2` | Model, with the provider prefix. Optional. |
 ````
 
 - [ ] **Step 6: Lint, format, and run everything once**
