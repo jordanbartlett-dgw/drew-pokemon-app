@@ -110,3 +110,37 @@ def test_rejects_non_integer_limit_forms(sql):
 def test_nested_limit_without_outer_limit_gets_outer_limit_appended():
     out = validate_sql("SELECT * FROM (SELECT * FROM v_pokemon LIMIT 5) AS t")
     assert out == f"SELECT * FROM (SELECT * FROM v_pokemon LIMIT 5) AS t LIMIT {MAX_ROWS}"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "(SELECT * FROM v_pokemon LIMIT 5000)",
+        "((SELECT * FROM v_pokemon))",
+        "(SELECT id FROM v_pokemon) UNION (SELECT id FROM v_pokemon)",
+        "(WITH x AS (SELECT 1) SELECT * FROM x)",
+        "   (SELECT 1)",
+    ],
+)
+def test_rejects_leading_parenthesis(sql):
+    with pytest.raises(UnsafeSqlError, match="parentheses"):
+        validate_sql(sql)
+
+
+def test_allows_unwrapped_union():
+    out = validate_sql("SELECT id FROM v_pokemon UNION SELECT id FROM v_pokemon")
+    assert out.endswith(f"LIMIT {MAX_ROWS}")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (SELECT * FROM v_pokemon) AS t",
+        "SELECT id, (SELECT COUNT(*) FROM v_pokemon) AS c FROM v_pokemon",
+        "SELECT * FROM v_pokemon WHERE id IN (SELECT id FROM v_pokemon)",
+        "WITH fast AS (SELECT * FROM v_pokemon WHERE speed > 100) SELECT id FROM fast",
+    ],
+)
+def test_allows_legitimate_non_leading_parens(sql):
+    out = validate_sql(sql)
+    assert out.endswith(f"LIMIT {MAX_ROWS}")

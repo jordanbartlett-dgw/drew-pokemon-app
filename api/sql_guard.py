@@ -65,7 +65,24 @@ def validate_sql(sql: str) -> str:
     if ";" in scrubbed:
         raise UnsafeSqlError("Only one statement is allowed. Remove the semicolon.")
 
-    head = scrubbed.lstrip("(").split(None, 1)[0].upper() if scrubbed.strip() else ""
+    # A leading '(' is rejected outright rather than stripped. Wrapping the
+    # whole statement in parentheses (or unioning two parenthesized SELECTs)
+    # is syntactically valid SQLite on its own, but the LIMIT clause we
+    # append lands after the closing paren, e.g. "(SELECT ...) LIMIT 200",
+    # which SQLite rejects as a syntax error near "(" -- the same
+    # accept-but-unexecutable outcome already fixed for LIMIT arguments.
+    # There's no legitimate need for a wrapped top-level statement here: the
+    # model can always write the unwrapped form instead. Parens elsewhere
+    # (a FROM subquery, a scalar subquery, WHERE ... IN (...), a CTE body)
+    # are untouched since only a paren at the very start is checked.
+    stripped = scrubbed.strip()
+    if stripped.startswith("("):
+        raise UnsafeSqlError(
+            "Do not wrap the query in parentheses. Start the statement with SELECT or "
+            "WITH directly, e.g. 'SELECT ...' not '(SELECT ...)'."
+        )
+
+    head = stripped.split(None, 1)[0].upper() if stripped else ""
     if head not in {"SELECT", "WITH"}:
         raise UnsafeSqlError(
             f"Queries must start with SELECT or WITH, got {head or 'nothing'}. "
