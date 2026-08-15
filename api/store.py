@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 from pydantic_ai import ModelMessagesTypeAdapter
@@ -11,6 +12,8 @@ from pydantic_core import to_jsonable_python
 from api.models import ConversationSummary, StoredTurn, ToolEvent
 
 TITLE_MAX_LENGTH = 60
+
+_lock = threading.Lock()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -33,6 +36,15 @@ CREATE INDEX IF NOT EXISTS idx_turns_conversation ON turns(conversation_id);
 
 
 def open_store(db_path: Path) -> sqlite3.Connection:
+    """Open a writable connection to the conversation store.
+
+    check_same_thread=False lets this single connection be shared across FastAPI's
+    threadpool, but that only disables sqlite3's same-thread assertion; it does not
+    make the connection safe for concurrent use on its own. The connection is safe
+    to share across threads provided ALL access goes through this module's
+    functions, which serialize every statement (reads and writes) via a module-level
+    lock, matching the pattern api/db.py uses for the read-only Pokédex connection.
+    """
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -40,8 +52,9 @@ def open_store(db_path: Path) -> sqlite3.Connection:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(_SCHEMA)
-    conn.commit()
+    with _lock:
+        conn.executescript(_SCHEMA)
+        conn.commit()
 
 
 def title_from(user_text: str) -> str:
@@ -52,29 +65,32 @@ def title_from(user_text: str) -> str:
 
 
 def create_conversation(conn: sqlite3.Connection, title: str) -> int:
-    cursor = conn.execute("INSERT INTO conversations (title) VALUES (?)", (title,))
-    conn.commit()
-    return int(cursor.lastrowid)
+    with _lock:
+        cursor = conn.execute("INSERT INTO conversations (title) VALUES (?)", (title,))
+        conn.commit()
+        return int(cursor.lastrowid)
 
 
 def list_conversations(conn: sqlite3.Connection) -> list[ConversationSummary]:
-    rows = conn.execute(
-        """
-        SELECT c.id, c.title, c.created_at, c.updated_at,
-               (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id) AS turn_count
-        FROM conversations c
-        ORDER BY c.updated_at DESC, c.id DESC
-        """
-    ).fetchall()
+    with _lock:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.title, c.created_at, c.updated_at,
+                   (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id) AS turn_count
+            FROM conversations c
+            ORDER BY c.updated_at DESC, c.id DESC
+            """
+        ).fetchall()
     return [ConversationSummary(**dict(row)) for row in rows]
 
 
 def load_turns(conn: sqlite3.Connection, conversation_id: int) -> list[StoredTurn]:
-    rows = conn.execute(
-        "SELECT id, user_text, assistant_text, tool_events_json, created_at "
-        "FROM turns WHERE conversation_id = ? ORDER BY id",
-        (conversation_id,),
-    ).fetchall()
+    with _lock:
+        rows = conn.execute(
+            "SELECT id, user_text, assistant_text, tool_events_json, created_at "
+            "FROM turns WHERE conversation_id = ? ORDER BY id",
+            (conversation_id,),
+        ).fetchall()
     return [
         StoredTurn(
             id=row["id"],
@@ -88,10 +104,11 @@ def load_turns(conn: sqlite3.Connection, conversation_id: int) -> list[StoredTur
 
 
 def load_history(conn: sqlite3.Connection, conversation_id: int) -> list[ModelMessage]:
-    rows = conn.execute(
-        "SELECT model_messages_json FROM turns WHERE conversation_id = ? ORDER BY id",
-        (conversation_id,),
-    ).fetchall()
+    with _lock:
+        rows = conn.execute(
+            "SELECT model_messages_json FROM turns WHERE conversation_id = ? ORDER BY id",
+            (conversation_id,),
+        ).fetchall()
     history: list[ModelMessage] = []
     for row in rows:
         history.extend(ModelMessagesTypeAdapter.validate_json(row["model_messages_json"]))
@@ -106,26 +123,30 @@ def save_turn(
     tool_events: list[ToolEvent],
     new_messages: list[ModelMessage],
 ) -> int:
-    cursor = conn.execute(
-        "INSERT INTO turns (conversation_id, user_text, assistant_text, "
-        "tool_events_json, model_messages_json) VALUES (?, ?, ?, ?, ?)",
-        (
-            conversation_id,
-            user_text,
-            assistant_text,
-            json.dumps([e.model_dump() for e in tool_events]),
-            json.dumps(to_jsonable_python(new_messages)),
-        ),
-    )
-    conn.execute(
-        "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
-        (conversation_id,),
-    )
-    conn.commit()
-    return int(cursor.lastrowid)
+    with _lock:
+        cursor = conn.execute(
+            "INSERT INTO turns (conversation_id, user_text, assistant_text, "
+            "tool_events_json, model_messages_json) VALUES (?, ?, ?, ?, ?)",
+            (
+                conversation_id,
+                user_text,
+                assistant_text,
+                json.dumps([e.model_dump() for e in tool_events]),
+                json.dumps(to_jsonable_python(new_messages)),
+            ),
+        )
+        conn.execute(
+            "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
+            (conversation_id,),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
 
 
 def delete_conversation(conn: sqlite3.Connection, conversation_id: int) -> None:
-    conn.execute("DELETE FROM turns WHERE conversation_id = ?", (conversation_id,))
-    conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-    conn.commit()
+    with _lock:
+        # PRAGMA foreign_keys = ON (set in open_store) already makes ON DELETE CASCADE
+        # remove these rows; this explicit delete is belt-and-braces, not load-bearing.
+        conn.execute("DELETE FROM turns WHERE conversation_id = ?", (conversation_id,))
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        conn.commit()

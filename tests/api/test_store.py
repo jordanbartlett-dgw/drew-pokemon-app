@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from api.models import ToolEvent
@@ -78,3 +80,24 @@ def test_delete_removes_conversation_and_turns(pokedex_path):
     delete_conversation(conn, cid)
     assert list_conversations(conn) == []
     assert load_turns(conn, cid) == []
+
+
+def test_save_turn_is_safe_under_concurrent_writers(pokedex_path):
+    conn = _store(pokedex_path)
+    cid = create_conversation(conn, "chat")
+    n = 25
+
+    def _save(i: int) -> None:
+        save_turn(conn, cid, f"question {i}", f"answer {i}", [], _messages(f"question {i}"))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_save, range(n)))
+
+    turns = load_turns(conn, cid)
+    assert len(turns) == n
+    user_texts = {t.user_text for t in turns}
+    assert user_texts == {f"question {i}" for i in range(n)}
+
+    summaries = list_conversations(conn)
+    assert summaries[0].id == cid
+    assert summaries[0].turn_count == n
