@@ -9,6 +9,7 @@ settings = get_settings()
 
 app = create_app(
     db_path=settings.db_path,
+    store_path=settings.store_path,
     images_dir=settings.images_dir,
     model=settings.openai_model,
     web_dist=settings.web_dist,

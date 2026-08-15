@@ -21,6 +21,7 @@ from api.store import (
     create_conversation,
     delete_conversation,
     ensure_schema,
+    get_conversation_title,
     list_conversations,
     load_history,
     load_turns,
@@ -43,6 +44,7 @@ def create_app(
     db_path: Path,
     images_dir: Path,
     model: str | Model,
+    store_path: Path = Path("data/app.db"),
     web_dist: Path | None = None,
     daily_budget_usd: float = 0.25,
     usage_limits: UsageLimits | None = None,
@@ -50,7 +52,10 @@ def create_app(
     app = FastAPI(title=APP_NAME)
 
     read_conn = open_read_only(db_path)
-    store_conn = open_store(db_path)
+    # Drew's conversations and the daily usage log live in store_path, a file
+    # separate from db_path's disposable, ingest-owned Pokédex -- see api/settings.py.
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_conn = open_store(store_path)
     ensure_schema(store_conn)
     ensure_budget_schema(store_conn)
     agent = build_agent(model)
@@ -100,10 +105,13 @@ def create_app(
             conversation_id = create_conversation(store_conn, title_from(message))
             title = title_from(message)
         else:
-            summaries = [s for s in list_conversations(store_conn) if s.id == conversation_id]
-            if not summaries:
+            # Not list_conversations: it hides zero-turn conversations from the
+            # sidebar (Important 4), but a conversation whose first turn hasn't
+            # saved yet must still be a valid continuation target, not a 404.
+            found_title = get_conversation_title(store_conn, conversation_id)
+            if found_title is None:
                 raise HTTPException(status_code=404, detail="No such conversation")
-            title = summaries[0].title
+            title = found_title
 
         async def body() -> AsyncIterator[str]:
             yield frame("start", {"conversation_id": conversation_id, "title": title})

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -40,9 +41,15 @@ async def _stream_script(messages: list[ModelMessage], info: AgentInfo):
 
 
 @pytest.fixture
-def client(pokedex_path, tmp_path):
+def store_path(tmp_path) -> Path:
+    return tmp_path / "app.db"
+
+
+@pytest.fixture
+def client(pokedex_path, store_path, tmp_path):
     app = create_app(
         db_path=pokedex_path,
+        store_path=store_path,
         images_dir=tmp_path,
         model=FunctionModel(_script, stream_function=_stream_script),
     )
@@ -51,7 +58,7 @@ def client(pokedex_path, tmp_path):
 
 
 @pytest.fixture
-def client_with_web_dist(pokedex_path, tmp_path):
+def client_with_web_dist(pokedex_path, store_path, tmp_path):
     """A client whose app has a built frontend mounted, like the Minisforum deploy."""
     web_dist = tmp_path / "build"
     web_dist.mkdir()
@@ -60,6 +67,7 @@ def client_with_web_dist(pokedex_path, tmp_path):
     images_dir.mkdir()
     app = create_app(
         db_path=pokedex_path,
+        store_path=store_path,
         images_dir=images_dir,
         model=FunctionModel(_script, stream_function=_stream_script),
         web_dist=web_dist,
@@ -193,7 +201,7 @@ async def test_health_reports_budget(client):
     assert body["spent_today_usd"] == 0.0
 
 
-async def test_over_budget_never_calls_the_model(pokedex_path, tmp_path):
+async def test_over_budget_never_calls_the_model(pokedex_path, store_path, tmp_path):
     calls: list[int] = []
 
     def counting(messages, info):
@@ -206,11 +214,12 @@ async def test_over_budget_never_calls_the_model(pokedex_path, tmp_path):
 
     app = create_app(
         db_path=pokedex_path,
+        store_path=store_path,
         images_dir=tmp_path,
         model=FunctionModel(counting, stream_function=stream_counting),
         daily_budget_usd=0.0001,
     )
-    conn = open_store(pokedex_path)
+    conn = open_store(store_path)
     ensure_budget_schema(conn)
     record_usage(conn, "openai:gpt-5.6-luna", 1_000_000, 0)
 
@@ -224,22 +233,22 @@ async def test_over_budget_never_calls_the_model(pokedex_path, tmp_path):
     assert calls == []
 
 
-async def test_usage_is_recorded_after_a_turn(client, pokedex_path):
+async def test_usage_is_recorded_after_a_turn(client, store_path):
     async with client:
         await client.post("/api/chat", json={"message": "Who is Pikachu?"})
         body = (await client.get("/api/health")).json()
     assert body["spent_today_usd"] > 0
 
 
-async def test_happy_path_bills_exactly_one_usage_row(client, pokedex_path):
+async def test_happy_path_bills_exactly_one_usage_row(client, store_path):
     async with client:
         await client.post("/api/chat", json={"message": "Who is Pikachu?"})
-    store = open_store(pokedex_path)
+    store = open_store(store_path)
     rows = store.execute("SELECT COUNT(*) AS n FROM usage_log").fetchone()
     assert rows["n"] == 1
 
 
-async def test_disconnect_mid_turn_still_bills_and_persists(pokedex_path, tmp_path):
+async def test_disconnect_mid_turn_still_bills_and_persists(pokedex_path, store_path, tmp_path):
     """Simulate a client (Drew's iPad) walking away mid-answer.
 
     `httpx.ASGITransport` cannot express a genuine mid-stream disconnect: its
@@ -261,6 +270,7 @@ async def test_disconnect_mid_turn_still_bills_and_persists(pokedex_path, tmp_pa
     """
     app = create_app(
         db_path=pokedex_path,
+        store_path=store_path,
         images_dir=tmp_path,
         model=FunctionModel(_script, stream_function=_stream_script),
     )
@@ -280,7 +290,7 @@ async def test_disconnect_mid_turn_still_bills_and_persists(pokedex_path, tmp_pa
     # Walk away before the model's final answer streams back or completes.
     await gen.aclose()
 
-    store = open_store(pokedex_path)
+    store = open_store(store_path)
     usage_rows = store.execute("SELECT * FROM usage_log").fetchall()
     assert len(usage_rows) == 1
     assert usage_rows[0]["input_tokens"] > 0
@@ -288,3 +298,66 @@ async def test_disconnect_mid_turn_still_bills_and_persists(pokedex_path, tmp_pa
     turns = load_turns(store, conversation_id)
     assert len(turns) == 1
     assert turns[0].tool_events[0].tool_name == "find_pokemon"
+
+
+async def test_conversations_and_usage_land_in_store_path_not_db_path(
+    client, pokedex_path, store_path
+):
+    """Critical 2: conversations and usage_log live in store_path, a file
+    completely separate from the Pokédex at db_path. ingest.sync only ever
+    deletes/rebuilds db_path (see tests/ingest/test_sync.py), so this separation
+    is what makes re-running the ingest safe for Drew's conversations."""
+    async with client:
+        await client.post("/api/chat", json={"message": "Who is Pikachu?"})
+
+    assert store_path.exists()
+    store = open_store(store_path)
+    assert store.execute("SELECT COUNT(*) AS n FROM conversations").fetchone()["n"] == 1
+    assert store.execute("SELECT COUNT(*) AS n FROM usage_log").fetchone()["n"] == 1
+
+    # db_path (the Pokédex) has no conversations/turns/usage_log tables at all --
+    # confirms the two files are genuinely independent, not just different paths
+    # to data that got duplicated into both.
+    pokedex_conn = open_store(pokedex_path)
+    table_names = {
+        row["name"]
+        for row in pokedex_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert "conversations" not in table_names
+    assert "usage_log" not in table_names
+
+
+async def test_zero_turn_conversation_excluded_from_listing(pokedex_path, store_path, tmp_path):
+    """Important 4: a conversation that never got a turn saved (over-budget,
+    disconnect before any token, early error) must not clutter the sidebar."""
+    calls: list[int] = []
+
+    def counting(messages, info):
+        calls.append(1)
+        return ModelResponse(parts=[TextPart("should not happen")])
+
+    async def stream_counting(messages, info):
+        calls.append(1)
+        yield "should not happen"
+
+    app = create_app(
+        db_path=pokedex_path,
+        store_path=store_path,
+        images_dir=tmp_path,
+        model=FunctionModel(counting, stream_function=stream_counting),
+        daily_budget_usd=0.0001,
+    )
+    conn = open_store(store_path)
+    ensure_budget_schema(conn)
+    record_usage(conn, "openai:gpt-5.6-luna", 1_000_000, 0)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as over_budget:
+        # Over budget on the very first message: the conversation row is created,
+        # but the turn never saves.
+        await over_budget.post("/api/chat", json={"message": "Who is Pikachu?"})
+        listing = await over_budget.get("/api/conversations")
+
+    assert listing.json() == []
