@@ -1,0 +1,10 @@
+.superpowers/
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+node_modules/
+web/.svelte-kit/
+web/build/
+.pytest_cache/
