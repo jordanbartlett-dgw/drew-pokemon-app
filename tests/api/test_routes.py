@@ -50,6 +50,24 @@ def client(pokedex_path, tmp_path):
     return httpx.AsyncClient(transport=transport, base_url="http://test")
 
 
+@pytest.fixture
+def client_with_web_dist(pokedex_path, tmp_path):
+    """A client whose app has a built frontend mounted, like the Minisforum deploy."""
+    web_dist = tmp_path / "build"
+    web_dist.mkdir()
+    (web_dist / "index.html").write_text("<html><body>drew's pokemon app</body></html>")
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    app = create_app(
+        db_path=pokedex_path,
+        images_dir=images_dir,
+        model=FunctionModel(_script, stream_function=_stream_script),
+        web_dist=web_dist,
+    )
+    transport = httpx.ASGITransport(app=app)
+    return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
 def _events(body: str) -> list[tuple[str, dict]]:
     out = []
     for block in body.strip().split("\n\n"):
@@ -104,6 +122,51 @@ async def test_unknown_conversation_is_404(client):
     async with client:
         response = await client.get("/api/conversations/999")
     assert response.status_code == 404
+
+
+async def test_unknown_route_without_web_dist_stays_a_plain_404(client):
+    """No `web_dist` mounted (the default in most tests) -- nothing tries to
+    read a nonexistent index.html, and an unmatched route is a plain 404."""
+    async with client:
+        response = await client.get("/some/unknown/path")
+    assert response.status_code == 404
+
+
+async def test_unknown_deep_link_serves_the_app_shell_with_web_dist(client_with_web_dist):
+    """SPA fallback: an unmatched path, like Drew's iPad reloading on a client-side
+    route, gets the built app's index.html with a 200, not a 404."""
+    async with client_with_web_dist as client:
+        response = await client.get("/some/unknown/path")
+    assert response.status_code == 200
+    assert "drew's pokemon app" in response.text.lower()
+    assert response.headers["content-type"].startswith("text/html")
+
+
+async def test_unknown_api_route_is_still_json_404_with_web_dist(client_with_web_dist):
+    """The important guardrail: the SPA fallback must not swallow API 404s.
+    If it did, every frontend error path would silently get a web page back
+    instead of an error it can detect."""
+    async with client_with_web_dist as client:
+        response = await client.get("/api/does-not-exist")
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/json")
+    assert "detail" in response.json()
+
+
+async def test_unknown_conversation_is_still_json_404_with_web_dist(client_with_web_dist):
+    """Same guardrail, exercised through the existing conversations 404 path
+    rather than a synthetic unmatched route."""
+    async with client_with_web_dist as client:
+        response = await client.get("/api/conversations/999")
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/json")
+
+
+async def test_missing_image_is_404_not_the_app_shell(client_with_web_dist):
+    async with client_with_web_dist as client:
+        response = await client.get("/images/does-not-exist.png")
+    assert response.status_code == 404
+    assert not response.headers["content-type"].startswith("text/html")
 
 
 async def test_delete_conversation(client):
