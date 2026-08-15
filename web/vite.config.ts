@@ -29,11 +29,15 @@ export default defineConfig({
 		projects: [
 			{
 				extends: './vite.config.ts',
+				resolve: {
+					conditions: ['browser']
+				},
 				test: {
 					name: 'server',
 					environment: 'jsdom',
 					include: ['src/**/*.{test,spec}.{js,ts}'],
-					exclude: ['src/**/*.svelte.{test,spec}.{js,ts}']
+					exclude: ['src/**/*.svelte.{test,spec}.{js,ts}'],
+					setupFiles: ['./vitest-setup.ts']
 				}
 			}
 		]
