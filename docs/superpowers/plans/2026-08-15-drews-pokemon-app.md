@@ -2349,6 +2349,10 @@ git commit -m "feat: matchup, comparison, evolution, and SQL tools"
 - Consumes: everything in `api.tools`, `api.sql_guard.UnsafeSqlError`
 - Produces: `api.agent.PokedexDeps` (dataclass with `conn: sqlite3.Connection`), `api.agent.build_agent(model: str | Model) -> Agent[PokedexDeps]`, and `api.agent.SYSTEM_PROMPT`.
 
+> **Amendment (2026-08-15, ruled during execution).** `test_agent_registers_all_five_tools` below cannot pass against a correct implementation. `TestModel()` synthesises deterministic dummy arguments (`'a'`), which `type_matchup` and `run_sql` correctly reject via `ModelRetry`; the identical arguments regenerate on retry until `max_retries` is exhausted and the run raises. Registration is now asserted with `FunctionModel`, reading `info.function_tools` and returning a `TextPart` immediately so no tool executes. A further test locks down the retry-exhaustion behaviour as an intentional budget backstop: a model that keeps sending the same rejected input terminates the run rather than looping. Verified on pydantic-ai 2.31.0. Implemented in `e116067`.
+>
+> Live check on this task: "Which Water type under 10kg is the fastest?" returned Wugtrio (5.4 kg, speed 120), correct against the database, at 2,627 input / 151 output tokens — about $0.0007 per question, so the $0.25 daily cap is roughly 350 questions.
+
 Tool errors are raised as `ModelRetry` so the model sees the message and corrects itself instead of the run failing. This is what makes the `run_sql` escape hatch usable.
 
 - [ ] **Step 1: Write the failing test**
