@@ -804,6 +804,8 @@ Column contracts the agent tools in Tasks 10-14 depend on:
 - `v_pokemon`: `id, name, slug, generation, type1, type2, hp, attack, defense, special_attack, special_defense, speed, total_stats, height_m, weight_kg, is_legendary, is_mythical, artwork_path, sprite_path, genus, flavor_text`
 - `v_type_matchup`: `attacking, defending, multiplier`
 - `v_evolution`: `chain_id, from_name, to_name, trigger, min_level`
+
+> **Amendment (2026-08-15, found by real data in Task 7).** The `v_evolution` SQL below is wrong. `pokemon_evolution` carries one row per version-group/method combination, so dropping `version_group_id` from the SELECT yields duplicates — Eevee returned 19 rows instead of 8. `is_default = 1` alone is insufficient (PokeAPI marks several rows default for regional forms like Alolan Meowth); `DISTINCT` alone returns 10. As shipped, the view filters `ev.is_default = 1` and applies `ROW_NUMBER() OVER (PARTITION BY ev.evolved_species_id ORDER BY ev.id)`, keeping `rn = 1`. Task 7's `verify()` now asserts Eevee returns exactly 8 and that no `(chain_id, from_name, to_name)` triple repeats anywhere. Implemented in `b8ea933`, tested in `afefda7`.
 - `v_pokemon_moves`: `pokemon, move, method, level, move_type, power, accuracy`
 
 `height` is decimetres and `weight` is hectograms in the source data, so both are divided by 10. Stat ids are 1 hp, 2 attack, 3 defense, 4 special-attack, 5 special-defense, 6 speed. `damage_factor` is 0/50/100/200, so the multiplier is `damage_factor / 100.0`.
