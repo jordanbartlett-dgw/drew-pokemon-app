@@ -7,7 +7,8 @@ Status: Approved
 
 A local app that answers Drew's questions about Pokémon. PokeAPI data lives in a
 local SQLite database. An OpenAI model queries it through tools and answers in a
-chat UI that renders real Pokémon cards and artwork inline.
+chat UI that renders real Pokémon cards and artwork inline. It runs as a service
+on the Minisforum and Drew uses it from his iPad over Tailscale.
 
 Drew is a kid. The assistant is warm and enthusiastic, uses short sentences,
 explains terms like "base stats" instead of assuming them, and leans on pictures.
@@ -22,7 +23,8 @@ explains terms like "base stats" instead of assuming them, and leans on pictures
 
 ## Architecture
 
-Three components, one repo, entirely local. No auth, no deploy.
+Three components, one repo, entirely local. No auth. Deployed as a systemd user
+service on the Minisforum.
 
 ```
 pokemon_app/
@@ -37,6 +39,8 @@ pokemon_app/
 
 Development runs two processes: `uv run fastapi dev` on :8000 and
 `npm run dev` on :5173, with Vite proxying `/api` and `/images` to :8000.
+In production there is one process: FastAPI serves the built frontend, the API,
+and the images together. See Deployment below.
 
 Python 3.12+, managed with uv. Ruff for lint and format. Type hints throughout,
 Pydantic models for all data crossing a boundary.
@@ -105,8 +109,9 @@ Ingest is not complete until these pass:
 
 FastAPI app. pydantic-ai v2 agent using the `openai:` provider. The model id
 comes from an environment variable so it can be swapped without a code change.
-Configuration via pydantic-settings, never hardcoded. The OpenAI API key is
-read from the environment.
+Configuration via pydantic-settings, never hardcoded. Secrets come from
+Infisical (project `drew-pokemon`), injected by `infisical run --`. There is no
+`.env` file.
 
 ### Tools
 
@@ -204,9 +209,44 @@ Run single tests with `uv run pytest`, not the full suite, unless asked.
 - **Tools**: each tool tested against a small fixture database with known values.
 - **Frontend**: component tests for `PokemonCard` and the SSE reader. No E2E.
 
+## Deployment
+
+The app runs on the Minisforum (Pop!_OS) and Drew reaches it from his iPad over
+Tailscale. It is a household appliance, not a dev setup.
+
+- One process. The SvelteKit app is built to static files and served by the same
+  FastAPI process that serves the API, on a single port. No Node process at
+  runtime.
+- A systemd **user** service starts it on boot and restarts it on crash.
+  `loginctl enable-linger` so it runs without Jordan logged in.
+- `tailscale serve` publishes it as `https://<host>.<tailnet>.ts.net` with a real
+  certificate. The app itself binds to `127.0.0.1` and is never exposed to the
+  LAN or the internet. Drew adds it to his iPad home screen.
+- No auth. Reachability is the tailnet, which is the security boundary.
+
+## Cost control
+
+Two independent limits.
+
+**Per turn**, `UsageLimits(request_limit=8, tool_calls_limit=12,
+total_tokens_limit=20000)` bounds a single question. A model stuck in a tool loop
+raises `UsageLimitExceeded` instead of billing forever. Drew sees a friendly
+message.
+
+**Per day**, every turn's token usage is priced and logged to SQLite. Before each
+turn the app sums today's spend and refuses past $0.25 with "That's all the
+Pokémon questions for today, come back tomorrow!" The cap resets at local
+midnight.
+
+The default model is `openai:gpt-5.6-luna` at $0.20 per 1M input and $1.20 per 1M
+output tokens, roughly $0.0012 per question, so $0.25 is about 200 questions a
+day. The model id is configurable and the pricing table is a constant that must
+be updated when it changes. An unknown model is priced at the most expensive
+known rate so the cap never silently over-spends.
+
 ## Out of scope
 
-- Auth, Docker, and any deployment. This runs on Jordan's machine.
+- Auth, Docker, and any cloud deployment.
 - Items, berries, machines, locations, encounters, contests.
 - A battle simulator. "Would X beat Y" is the model reasoning over stats and
   type effectiveness, not a damage calculation. The assistant says so when the

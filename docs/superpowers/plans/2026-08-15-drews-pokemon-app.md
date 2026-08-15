@@ -4,7 +4,7 @@
 
 **Goal:** A local chat app where Drew asks questions about Pokémon and gets kid-friendly answers backed by a local SQLite clone of PokeAPI, with artwork rendered inline.
 
-**Architecture:** Python ingests PokeAPI's own CSV dump into `data/pokedex.db` and downloads artwork to `data/images/`. A FastAPI service runs a pydantic-ai v2 agent (OpenAI) with five tools over that database and streams text deltas plus typed tool results to the browser as SSE. A SvelteKit 2 / Svelte 5 frontend renders those tool results as Pokémon cards.
+**Architecture:** Python ingests PokeAPI's own CSV dump into `data/pokedex.db` and downloads artwork to `data/images/`. A FastAPI service runs a pydantic-ai v2 agent (OpenAI) with five tools over that database and streams text deltas plus typed tool results to the browser as SSE. A SvelteKit 2 / Svelte 5 frontend renders those tool results as Pokémon cards. In production one FastAPI process serves the built frontend, the API, and the images; a systemd user service keeps it running and `tailscale serve` publishes it to Drew's iPad over HTTPS.
 
 **Tech Stack:** Python 3.12+ with uv, SQLite, FastAPI, pydantic-ai v2, pydantic-settings, ruff, pytest. SvelteKit 2, Svelte 5 runes, TypeScript strict, Tailwind CSS v4.
 
@@ -14,6 +14,7 @@
 - `from __future__ import annotations` at the top of every Python file.
 - Type hints on every function. Pydantic `BaseModel` for all data crossing a boundary. `model_config = ConfigDict(...)`, never `class Config`.
 - Configuration via pydantic-settings. No hardcoded paths, keys, or model ids.
+- Default model is `openai:gpt-5.6-luna` ($0.20 per 1M input, $1.20 per 1M output). Every run carries `UsageLimits(request_limit=8, tool_calls_limit=12, total_tokens_limit=20000)`. Daily spend is capped at $0.25 and refused with a kid-friendly message, never a stack trace.
 - Secrets come from Infisical, project `drew-pokemon`, injected by the CLI. There is no `.env` file and no `.env.example`. Every command that needs the OpenAI key is prefixed with `infisical run --`. `.infisical.json` is committed; it holds the project id and default environment, not secrets.
 - Ruff for lint and format: `uv run ruff check --fix . && uv run ruff format .`
 - pydantic-ai v2 only. Model strings carry a provider prefix (`openai:...`). `result.usage` is a property. No `instrument=`, `history_processors=`, `prepare_tools=`, or `event_stream_handler=` constructor args.
@@ -35,6 +36,7 @@ pyproject.toml              uv project, deps, ruff + pytest config
 
 api/settings.py             Settings (pydantic-settings) + get_settings()
 api/app.py                  the ASGI entry point the dev server loads
+api/budget.py               token pricing, usage log, daily cap
 api/db.py                   read-only SQLite connections, query()
 api/models.py               all Pydantic domain models
 api/sql_guard.py            validate_sql(): SELECT-only, LIMIT enforcement
@@ -56,6 +58,8 @@ tests/ingest/               loader, views, schema tests
 tests/api/                  sql_guard, tools, agent, store, sse, routes tests
 
 web/                        SvelteKit app (see Task 19 for internal layout)
+deploy/drews-pokemon-app.service   systemd user unit
+deploy/install.sh           build, install, enable, and tailscale serve
 ```
 
 ---
@@ -69,7 +73,7 @@ web/                        SvelteKit app (see Task 19 for internal layout)
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `api.settings.Settings` with fields `openai_api_key: SecretStr`, `openai_model: str`, `db_path: Path`, `images_dir: Path`; and `get_settings() -> Settings` (cached).
+- Produces: `api.settings.Settings` with fields `openai_api_key: SecretStr`, `openai_model: str`, `db_path: Path`, `images_dir: Path`, `web_dist: Path`, `daily_budget_usd: float`, `request_limit: int`, `tool_calls_limit: int`, `total_tokens_limit: int`; and `get_settings() -> Settings` (cached).
 
 - [ ] **Step 1: Initialise the uv project**
 
@@ -82,7 +86,7 @@ uv add --dev pytest anyio ruff httpx
 
 - [ ] **Step 2: Verify the OpenAI model id before hardcoding a default**
 
-The default below is `openai:gpt-5.2`. Confirm that model exists on this account, and if not pick the newest available and use it as the default:
+The default is `openai:gpt-5.6-luna`, chosen for price ($0.20 per 1M input, $1.20 per 1M output). Confirm that model exists on this account, and if not pick the newest available and use it as the default:
 
 ```bash
 infisical run -- bash -c 'curl -s https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"' \
@@ -141,12 +145,22 @@ def test_settings_reads_env(monkeypatch):
     assert settings.openai_model == "openai:gpt-test"
     assert settings.db_path == Path("data/pokedex.db")
     assert settings.images_dir == Path("data/images")
+    assert settings.web_dist == Path("web/build")
 
 
 def test_settings_model_has_provider_prefix(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.delenv("POKEDEX_OPENAI_MODEL", raising=False)
     assert ":" in Settings().openai_model
+
+
+def test_limit_defaults_are_conservative(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    settings = Settings()
+    assert settings.daily_budget_usd == 0.25
+    assert settings.request_limit == 8
+    assert settings.tool_calls_limit == 12
+    assert settings.total_tokens_limit == 20_000
 ```
 
 - [ ] **Step 5: Run it and confirm it fails**
@@ -172,9 +186,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", populate_by_name=True)
 
     openai_api_key: SecretStr
-    openai_model: str = "openai:gpt-5.2"
+    openai_model: str = "openai:gpt-5.6-luna"
     db_path: Path = Path("data/pokedex.db")
     images_dir: Path = Path("data/images")
+    web_dist: Path = Path("web/build")
+
+    # Cost control. See api/budget.py.
+    daily_budget_usd: float = 0.25
+    request_limit: int = 8
+    tool_calls_limit: int = 12
+    total_tokens_limit: int = 20_000
 
 
 @lru_cache
@@ -182,15 +203,19 @@ def get_settings() -> Settings:
     return Settings()
 ```
 
-Note: to let the model id come from a `POKEDEX_OPENAI_MODEL` secret rather than the field name, give it an alias:
+Note: `openai_api_key` reads the unprefixed `OPENAI_API_KEY`, because that is the secret name in Infisical. Everything tunable gets a `POKEDEX_` alias so it can be overridden per environment without colliding with anything else. Import `Field` and use these declarations in place of the plain defaults above:
 
 ```python
 from pydantic import Field, SecretStr
 
-    openai_model: str = Field(default="openai:gpt-5.2", alias="POKEDEX_OPENAI_MODEL")
+    openai_model: str = Field(default="openai:gpt-5.6-luna", alias="POKEDEX_OPENAI_MODEL")
+    daily_budget_usd: float = Field(default=0.25, alias="POKEDEX_DAILY_BUDGET_USD")
+    request_limit: int = Field(default=8, alias="POKEDEX_REQUEST_LIMIT")
+    tool_calls_limit: int = Field(default=12, alias="POKEDEX_TOOL_CALLS_LIMIT")
+    total_tokens_limit: int = Field(default=20_000, alias="POKEDEX_TOTAL_TOKENS_LIMIT")
 ```
 
-`populate_by_name=True` is already set in `model_config` above, so the field name still works too. Setting `POKEDEX_OPENAI_MODEL` in Infisical is optional; the default applies when it is absent.
+`populate_by_name=True` is already set in `model_config`, so the field names still work too. All of these are optional in Infisical; the defaults apply when absent.
 
 - [ ] **Step 7: Add pytest and ruff config to `pyproject.toml`**
 
@@ -226,7 +251,7 @@ def anyio_backend() -> str:
 - [ ] **Step 9: Run the tests and confirm they pass**
 
 Run: `uv run pytest tests/api/test_settings.py -v`
-Expected: PASS, 2 passed
+Expected: PASS, 3 passed
 
 - [ ] **Step 10: Commit**
 
@@ -2770,6 +2795,197 @@ git commit -m "feat: conversation and turn persistence"
 
 ---
 
+### Task 14b: Token pricing and the daily budget
+
+**Files:**
+- Create: `api/budget.py`
+- Test: `tests/api/test_budget.py`
+
+**Interfaces:**
+- Consumes: a writable connection from `api.store.open_store`
+- Produces:
+  - `api.budget.PRICING_USD_PER_MTOK: dict[str, tuple[float, float]]` — model id to (input, output) dollars per million tokens.
+  - `api.budget.price_of(model: str, input_tokens: int, output_tokens: int) -> float`
+  - `api.budget.ensure_schema(conn) -> None` — creates `usage_log`.
+  - `api.budget.record_usage(conn, model, input_tokens, output_tokens) -> float` returning the cost of that turn.
+  - `api.budget.spent_today(conn) -> float`
+  - `api.budget.is_over_budget(conn, cap_usd: float) -> bool`
+  - `api.budget.BUDGET_MESSAGE: str` — what Drew sees at the cap.
+
+An unknown model is priced at the most expensive rate in the table. Under-counting would let the cap silently overspend, and this is a kid's app on Jordan's card.
+
+The day boundary is local midnight, not UTC, because Drew's day is local.
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/api/test_budget.py`:
+
+```python
+from __future__ import annotations
+
+from api.budget import (
+    PRICING_USD_PER_MTOK,
+    BUDGET_MESSAGE,
+    ensure_schema,
+    is_over_budget,
+    price_of,
+    record_usage,
+    spent_today,
+)
+from api.store import open_store
+
+
+def _conn(pokedex_path):
+    conn = open_store(pokedex_path)
+    ensure_schema(conn)
+    return conn
+
+
+def test_pricing_table_has_the_default_model():
+    assert PRICING_USD_PER_MTOK["openai:gpt-5.6-luna"] == (0.20, 1.20)
+
+
+def test_price_of_known_model():
+    # 1M input at $0.20 plus 1M output at $1.20
+    assert price_of("openai:gpt-5.6-luna", 1_000_000, 1_000_000) == 1.40
+
+
+def test_price_of_a_realistic_turn_is_about_a_tenth_of_a_cent():
+    cost = price_of("openai:gpt-5.6-luna", 4_000, 300)
+    assert 0.001 < cost < 0.002
+
+
+def test_unknown_model_is_priced_at_the_most_expensive_rate():
+    dearest = max(PRICING_USD_PER_MTOK.values(), key=lambda rate: rate[0] + rate[1])
+    assert price_of("openai:something-new", 1_000_000, 1_000_000) == sum(dearest)
+
+
+def test_record_usage_accumulates_across_turns(pokedex_path):
+    conn = _conn(pokedex_path)
+    assert spent_today(conn) == 0.0
+    first = record_usage(conn, "openai:gpt-5.6-luna", 4_000, 300)
+    second = record_usage(conn, "openai:gpt-5.6-luna", 4_000, 300)
+    assert round(spent_today(conn), 8) == round(first + second, 8)
+
+
+def test_is_over_budget_only_once_the_cap_is_reached(pokedex_path):
+    conn = _conn(pokedex_path)
+    assert is_over_budget(conn, 0.25) is False
+    record_usage(conn, "openai:gpt-5.6-luna", 1_000_000, 0)  # $0.20
+    assert is_over_budget(conn, 0.25) is False
+    record_usage(conn, "openai:gpt-5.6-luna", 1_000_000, 0)  # $0.40 total
+    assert is_over_budget(conn, 0.25) is True
+
+
+def test_yesterdays_spend_does_not_count(pokedex_path):
+    conn = _conn(pokedex_path)
+    conn.execute(
+        "INSERT INTO usage_log (day, model, input_tokens, output_tokens, cost_usd) "
+        "VALUES (date('now','localtime','-1 day'), 'openai:gpt-5.6-luna', 1000000, 0, 0.20)"
+    )
+    conn.commit()
+    assert spent_today(conn) == 0.0
+
+
+def test_budget_message_is_kid_friendly():
+    assert "Drew" in BUDGET_MESSAGE
+    assert "tomorrow" in BUDGET_MESSAGE.lower()
+```
+
+- [ ] **Step 2: Run it and confirm it fails**
+
+Run: `uv run pytest tests/api/test_budget.py -v`
+Expected: FAIL, `ModuleNotFoundError: No module named 'api.budget'`
+
+- [ ] **Step 3: Implement `api/budget.py`**
+
+```python
+from __future__ import annotations
+
+import sqlite3
+
+# Dollars per million tokens, (input, output).
+# Source: https://developers.openai.com/api/docs/pricing, checked 2026-08-15.
+# Update this table when the model changes or prices move.
+PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "openai:gpt-5.6-luna": (0.20, 1.20),
+    "openai:gpt-5-nano": (0.05, 0.40),
+    "openai:gpt-5.4-nano": (0.20, 1.25),
+    "openai:gpt-5-mini": (0.25, 2.00),
+}
+
+BUDGET_MESSAGE = (
+    "That's all the Pokémon questions for today, Drew. Come back tomorrow!"
+)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT NOT NULL DEFAULT (date('now','localtime')),
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_usage_day ON usage_log(day);
+"""
+
+
+def _dearest_rate() -> tuple[float, float]:
+    return max(PRICING_USD_PER_MTOK.values(), key=lambda rate: rate[0] + rate[1])
+
+
+def price_of(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Cost in dollars. Unknown models are priced at the most expensive known rate."""
+    input_rate, output_rate = PRICING_USD_PER_MTOK.get(model, _dearest_rate())
+    return (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA)
+    conn.commit()
+
+
+def record_usage(
+    conn: sqlite3.Connection, model: str, input_tokens: int, output_tokens: int
+) -> float:
+    cost = price_of(model, input_tokens, output_tokens)
+    conn.execute(
+        "INSERT INTO usage_log (model, input_tokens, output_tokens, cost_usd) "
+        "VALUES (?, ?, ?, ?)",
+        (model, input_tokens, output_tokens, cost),
+    )
+    conn.commit()
+    return cost
+
+
+def spent_today(conn: sqlite3.Connection) -> float:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM usage_log "
+        "WHERE day = date('now','localtime')"
+    ).fetchone()
+    return float(row["total"])
+
+
+def is_over_budget(conn: sqlite3.Connection, cap_usd: float) -> bool:
+    return spent_today(conn) >= cap_usd
+```
+
+- [ ] **Step 4: Run the tests and confirm they pass**
+
+Run: `uv run pytest tests/api/test_budget.py -v`
+Expected: PASS, 8 passed
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add api/budget.py tests/api/test_budget.py
+git commit -m "feat: token pricing and daily budget cap"
+```
+
+---
+
 ### Task 15: SSE event mapping
 
 **Files:**
@@ -2780,8 +2996,10 @@ git commit -m "feat: conversation and turn persistence"
 - Consumes: `api.agent.build_agent`, `PokedexDeps`, `api.models.ToolEvent`
 - Produces:
   - `api.sse.frame(event: str, data: dict[str, Any]) -> str` — one SSE frame, `event:` line plus `data:` line plus blank line.
-  - `api.sse.TurnRecorder` dataclass with `text: str`, `tool_events: list[ToolEvent]`, `new_messages: list[ModelMessage]`.
-  - `api.sse.stream_turn(agent, deps, prompt, history, recorder) -> AsyncIterator[str]` yielding `token`, `tool`, and `error` frames. The caller emits `start` and `done`.
+  - `api.sse.TurnRecorder` dataclass with `text: str`, `tool_events: list[ToolEvent]`, `new_messages: list[ModelMessage]`, `input_tokens: int`, `output_tokens: int`.
+  - `api.sse.stream_turn(agent, deps, prompt, history, recorder, usage_limits) -> AsyncIterator[str]` yielding `token`, `tool`, `limit`, and `error` frames. The caller emits `start` and `done`.
+
+`UsageLimitExceeded` is caught separately from other errors. A runaway tool loop is an expected condition here, not a crash, and Drew must see a sentence rather than a traceback. The tokens burned before the limit tripped are still recorded on the recorder so they count against the daily budget.
 
 Tool arguments arrive on `FunctionToolCallEvent` and results on `FunctionToolResultEvent`, matched by `tool_call_id`. A `ModelRetry` surfaces as a retry-prompt part rather than a tool return, and is not emitted to the UI.
 
@@ -2795,6 +3013,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic_ai import UsageLimits
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -2855,6 +3074,28 @@ async def test_recorder_captures_turn_state(pokedex):
     assert len(recorder.new_messages) >= 2
 
 
+async def test_usage_limit_emits_a_limit_frame_not_an_error(pokedex):
+    def loop(messages: list[ModelMessage], info: AgentInfo):
+        return ModelResponse(parts=[ToolCallPart("find_pokemon", {"name_or_id": "pikachu"})])
+
+    recorder = TurnRecorder()
+    agent = build_agent(FunctionModel(loop))
+    frames = [
+        f
+        async for f in stream_turn(
+            agent,
+            PokedexDeps(conn=pokedex),
+            "loop forever",
+            [],
+            recorder,
+            UsageLimits(request_limit=3),
+        )
+    ]
+    names = [name for name, _ in _parse(frames)]
+    assert names[-1] == "limit"
+    assert "Drew" in _parse(frames)[-1][1]["message"]
+
+
 async def test_model_failure_emits_an_error_frame(pokedex):
     def boom(messages: list[ModelMessage], info: AgentInfo):
         raise RuntimeError("provider exploded")
@@ -2890,6 +3131,8 @@ from pydantic_ai import (
     FunctionToolResultEvent,
     PartDeltaEvent,
     TextPartDelta,
+    UsageLimitExceeded,
+    UsageLimits,
 )
 from pydantic_ai.messages import ModelMessage
 from pydantic_core import to_jsonable_python
@@ -2902,13 +3145,20 @@ def frame(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+LIMIT_MESSAGE = (
+    "Whoa, that question sent me in circles! Try asking it a different way, Drew."
+)
+
+
 @dataclass
 class TurnRecorder:
-    """Collects what the turn produced so the caller can persist it."""
+    """Collects what the turn produced so the caller can persist and bill it."""
 
     text: str = ""
     tool_events: list[ToolEvent] = field(default_factory=list)
     new_messages: list[ModelMessage] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 async def stream_turn(
@@ -2917,13 +3167,14 @@ async def stream_turn(
     prompt: str,
     history: list[ModelMessage],
     recorder: TurnRecorder,
+    usage_limits: UsageLimits | None = None,
 ) -> AsyncIterator[str]:
     pending_args: dict[str, dict[str, Any]] = {}
     chunks: list[str] = []
 
     try:
         async with agent.run_stream_events(
-            prompt, deps=deps, message_history=history
+            prompt, deps=deps, message_history=history, usage_limits=usage_limits
         ) as events:
             async for event in events:
                 if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
@@ -2953,6 +3204,11 @@ async def stream_turn(
                 elif isinstance(event, AgentRunResultEvent):
                     recorder.new_messages = event.result.new_messages()
                     recorder.text = "".join(chunks) or str(event.result.output)
+                    recorder.input_tokens = event.result.usage.input_tokens
+                    recorder.output_tokens = event.result.usage.output_tokens
+    except UsageLimitExceeded:
+        recorder.text = "".join(chunks) or LIMIT_MESSAGE
+        yield frame("limit", {"message": LIMIT_MESSAGE})
     except Exception as exc:  # noqa: BLE001 - surfaced to the browser, not swallowed
         recorder.text = "".join(chunks)
         yield frame("error", {"message": f"{type(exc).__name__}: {exc}"})
@@ -2961,7 +3217,7 @@ async def stream_turn(
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `uv run pytest tests/api/test_sse.py -v`
-Expected: PASS, 4 passed
+Expected: PASS, 5 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2980,7 +3236,7 @@ git commit -m "feat: map agent stream events to SSE frames"
 
 **Interfaces:**
 - Consumes: everything in `api.*`
-- Produces: `api.main.create_app(db_path: Path, images_dir: Path, model: str | Model) -> FastAPI`, and `api.app.app`, the default instance built from `get_settings()`.
+- Produces: `api.main.create_app(db_path, images_dir, model, web_dist=None, daily_budget_usd=0.25, usage_limits=None) -> FastAPI`, and `api.app.app`, the default instance built from `get_settings()`.
 
 The two modules are separate on purpose. `api/main.py` holds only the factory, so importing it in tests needs neither an OpenAI key nor a built database. `api/app.py` is the entry point the dev server loads, and it does require both.
 
@@ -2992,8 +3248,11 @@ Routes:
 | `GET` | `/api/conversations` | List summaries, newest first. |
 | `GET` | `/api/conversations/{id}` | `{"conversation": summary, "turns": [...]}`. 404 if unknown. |
 | `DELETE` | `/api/conversations/{id}` | 204. |
-| `GET` | `/api/health` | `{"status": "ok", "pokemon_count": int}`. |
+| `GET` | `/api/health` | `{"status": "ok", "pokemon_count": int, "spent_today_usd": float, "daily_budget_usd": float}`. |
 | `GET` | `/images/...` | Static files from `images_dir`. |
+| `GET` | `/...` | The built SvelteKit app from `web_dist`, when that directory exists. Mounted last so it never shadows the API. |
+
+Two cost behaviours live here. Before a turn starts, if today's spend is at the cap the app emits a `limit` frame with `BUDGET_MESSAGE` and never calls the model. After a turn ends, the recorded token counts are priced and logged, including the tokens burned by a turn that hit `UsageLimitExceeded`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3009,7 +3268,10 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from api.budget import ensure_schema as ensure_budget_schema
+from api.budget import record_usage
 from api.main import create_app
+from api.store import open_store
 
 pytestmark = pytest.mark.anyio
 
@@ -3098,6 +3360,47 @@ async def test_empty_message_is_rejected(client):
     async with client:
         response = await client.post("/api/chat", json={"message": "   "})
     assert response.status_code == 422
+
+
+async def test_health_reports_budget(client):
+    async with client:
+        body = (await client.get("/api/health")).json()
+    assert body["daily_budget_usd"] == 0.25
+    assert body["spent_today_usd"] == 0.0
+
+
+async def test_over_budget_never_calls_the_model(pokedex_path, tmp_path):
+    calls: list[int] = []
+
+    def counting(messages, info):
+        calls.append(1)
+        return ModelResponse(parts=[TextPart("should not happen")])
+
+    app = create_app(
+        db_path=pokedex_path,
+        images_dir=tmp_path,
+        model=FunctionModel(counting),
+        daily_budget_usd=0.0001,
+    )
+    conn = open_store(pokedex_path)
+    ensure_budget_schema(conn)
+    record_usage(conn, "openai:gpt-5.6-luna", 1_000_000, 0)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/chat", json={"message": "Who is Pikachu?"})
+
+    events = _events(response.text)
+    assert [name for name, _ in events] == ["start", "limit", "done"]
+    assert "tomorrow" in events[1][1]["message"].lower()
+    assert calls == []
+
+
+async def test_usage_is_recorded_after_a_turn(client, pokedex_path):
+    async with client:
+        await client.post("/api/chat", json={"message": "Who is Pikachu?"})
+        body = (await client.get("/api/health")).json()
+    assert body["spent_today_usd"] > 0
 ```
 
 - [ ] **Step 2: Run it and confirm it fails**
@@ -3117,11 +3420,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic_ai import UsageLimits
 from pydantic_ai.models import Model
 
 from api.agent import PokedexDeps, build_agent
+from api.budget import BUDGET_MESSAGE, is_over_budget, record_usage, spent_today
+from api.budget import ensure_schema as ensure_budget_schema
 from api.db import open_read_only, query
-from api.settings import get_settings
 from api.sse import TurnRecorder, frame, stream_turn
 from api.store import (
     create_conversation,
@@ -3145,13 +3450,22 @@ class ChatRequest(BaseModel):
     conversation_id: int | None = None
 
 
-def create_app(db_path: Path, images_dir: Path, model: str | Model) -> FastAPI:
+def create_app(
+    db_path: Path,
+    images_dir: Path,
+    model: str | Model,
+    web_dist: Path | None = None,
+    daily_budget_usd: float = 0.25,
+    usage_limits: UsageLimits | None = None,
+) -> FastAPI:
     app = FastAPI(title=APP_NAME)
 
     read_conn = open_read_only(db_path)
     store_conn = open_store(db_path)
     ensure_schema(store_conn)
+    ensure_budget_schema(store_conn)
     agent = build_agent(model)
+    model_id = model if isinstance(model, str) else getattr(model, "model_name", "unknown")
 
     images_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/images", StaticFiles(directory=images_dir), name="images")
@@ -3159,7 +3473,14 @@ def create_app(db_path: Path, images_dir: Path, model: str | Model) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, object]:
         count = query(read_conn, "SELECT COUNT(*) AS n FROM v_pokemon")[0]["n"]
-        return {"status": "ok", "app": APP_NAME, "pokemon_count": count}
+        return {
+            "status": "ok",
+            "app": APP_NAME,
+            "pokemon_count": count,
+            "model": model_id,
+            "spent_today_usd": round(spent_today(store_conn), 6),
+            "daily_budget_usd": daily_budget_usd,
+        }
 
     @app.get("/api/conversations")
     def conversations() -> list[dict[str, object]]:
@@ -3198,12 +3519,22 @@ def create_app(db_path: Path, images_dir: Path, model: str | Model) -> FastAPI:
         async def body() -> AsyncIterator[str]:
             yield frame("start", {"conversation_id": conversation_id, "title": title})
 
+            if is_over_budget(store_conn, daily_budget_usd):
+                yield frame("limit", {"message": BUDGET_MESSAGE})
+                yield frame("done", {"conversation_id": conversation_id})
+                return
+
             recorder = TurnRecorder()
             history = load_history(store_conn, conversation_id)
             async for chunk in stream_turn(
-                agent, PokedexDeps(conn=read_conn), message, history, recorder
+                agent, PokedexDeps(conn=read_conn), message, history, recorder, usage_limits
             ):
                 yield chunk
+
+            if recorder.input_tokens or recorder.output_tokens:
+                record_usage(
+                    store_conn, model_id, recorder.input_tokens, recorder.output_tokens
+                )
 
             if recorder.new_messages:
                 save_turn(
@@ -3222,15 +3553,19 @@ def create_app(db_path: Path, images_dir: Path, model: str | Model) -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    # Mounted last, at the root, so it cannot shadow /api or /images.
+    if web_dist is not None and web_dist.is_dir():
+        app.mount("/", StaticFiles(directory=web_dist, html=True), name="web")
+
     return app
 ```
-
-Remove the now-unused `get_settings` import from `api/main.py`; it belongs to `api/app.py`.
 
 `api/app.py`:
 
 ```python
 from __future__ import annotations
+
+from pydantic_ai import UsageLimits
 
 from api.main import create_app
 from api.settings import get_settings
@@ -3241,13 +3576,22 @@ app = create_app(
     db_path=settings.db_path,
     images_dir=settings.images_dir,
     model=settings.openai_model,
+    web_dist=settings.web_dist,
+    daily_budget_usd=settings.daily_budget_usd,
+    usage_limits=UsageLimits(
+        request_limit=settings.request_limit,
+        tool_calls_limit=settings.tool_calls_limit,
+        total_tokens_limit=settings.total_tokens_limit,
+    ),
 )
 ```
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `uv run pytest tests/api/test_routes.py -v`
-Expected: PASS, 6 passed
+Expected: PASS, 9 passed
+
+`FunctionModel` reports non-zero token usage, which is what makes `test_usage_is_recorded_after_a_turn` meaningful. If it reports zero on your version, assert on a row count in `usage_log` instead.
 
 - [ ] **Step 5: Run the whole Python suite once**
 
@@ -3497,6 +3841,7 @@ export type SseEvent =
 	| { name: 'start'; data: { conversation_id: number; title: string } }
 	| { name: 'token'; data: { text: string } }
 	| { name: 'tool'; data: ToolEvent }
+	| { name: 'limit'; data: { message: string } }
 	| { name: 'done'; data: { conversation_id: number } }
 	| { name: 'error'; data: { message: string } };
 
@@ -3705,6 +4050,23 @@ describe('createChat', () => {
 		expect(chat.busy).toBe(false);
 	});
 
+	it('shows a limit frame as the answer, not an error', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue(
+				sseResponse([
+					'event: start\ndata: {"conversation_id":1,"title":"hi"}\n\n',
+					'event: limit\ndata: {"message":"That\'s all the Pokémon questions for today, Drew. Come back tomorrow!"}\n\n',
+					'event: done\ndata: {"conversation_id":1}\n\n'
+				])
+			)
+		);
+		const chat = createChat();
+		await chat.send('one more');
+		expect(chat.messages[1].text).toContain('Come back tomorrow');
+		expect(chat.error).toBeNull();
+	});
+
 	it('surfaces an error frame', async () => {
 		vi.stubGlobal(
 			'fetch',
@@ -3796,6 +4158,9 @@ export function createChat() {
 					assistant.text += event.data.text;
 				} else if (event.name === 'tool') {
 					assistant.toolEvents.push(event.data);
+				} else if (event.name === 'limit') {
+					// Budget or loop cap. Drew sees a sentence, not an error banner.
+					assistant.text = event.data.message;
 				} else if (event.name === 'error') {
 					error = event.data.message;
 				}
@@ -3847,7 +4212,7 @@ export function createChat() {
 - [ ] **Step 9: Run the tests and confirm they pass**
 
 Run: `cd web && npx vitest run src/lib/chat.test.ts`
-Expected: PASS, 4 passed
+Expected: PASS, 5 passed
 
 If Vitest reports that runes are unavailable in a `.ts` file, confirm the file is named `chat.svelte.ts` and that `vitest` is running through the SvelteKit Vite config, which applies the Svelte compiler to `.svelte.ts` files.
 
@@ -4747,6 +5112,198 @@ git commit -m "feat: chat screen with sidebar and starter questions"
 
 ---
 
+### Task 21b: Single-process deploy on the Minisforum
+
+**Files:**
+- Create: `deploy/drews-pokemon-app.service`, `deploy/install.sh`
+- Modify: `web/svelte.config.js` (static adapter), `web/src/routes/+layout.ts`
+
+**Interfaces:**
+- Consumes: `api.app.app`, `settings.web_dist`
+- Produces: a service that starts on boot and is reachable from Drew's iPad at `https://<host>.<tailnet>.ts.net`.
+
+The app binds to `127.0.0.1` only. `tailscale serve` is the sole path in, so the app is never on the LAN or the internet.
+
+- [ ] **Step 1: Switch SvelteKit to the static adapter**
+
+```bash
+cd web && npm install -D @sveltejs/adapter-static && npm uninstall @sveltejs/adapter-auto
+```
+
+`web/svelte.config.js`:
+
+```js
+import adapter from '@sveltejs/adapter-static';
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+
+export default {
+	preprocess: vitePreprocess(),
+	kit: {
+		adapter: adapter({ fallback: 'index.html' })
+	}
+};
+```
+
+`web/src/routes/+layout.ts` (new file) turns off SSR, since there is no Node process at runtime:
+
+```ts
+export const prerender = false;
+export const ssr = false;
+```
+
+- [ ] **Step 2: Build and confirm the output lands where the API expects it**
+
+```bash
+cd web && npm run build && ls build/index.html
+```
+
+Expected: `build/index.html` exists. That path matches `Settings.web_dist` (`web/build`).
+
+- [ ] **Step 3: Verify one process serves everything**
+
+```bash
+infisical run -- uv run python -m uvicorn api.app:app --host 127.0.0.1 --port 8000
+```
+
+In a second terminal:
+
+```bash
+curl -s localhost:8000/api/health | head -c 200; echo
+curl -s -o /dev/null -w "%{http_code} html\n" localhost:8000/
+curl -s -o /dev/null -w "%{http_code} image\n" localhost:8000/images/official-artwork/25.png
+```
+
+Expected: the health JSON, then `200 html` and `200 image`. If `/` returns 404 the build directory is missing or `web_dist` is wrong. If `/api/health` returns HTML, the static mount is shadowing the API and was mounted too early.
+
+- [ ] **Step 4: Write `deploy/drews-pokemon-app.service`**
+
+`%h` expands to the home directory, so this unit is not tied to a username. Infisical needs a machine identity for unattended runs, since an interactive login token expires. Jordan creates the identity and exports `INFISICAL_TOKEN` into `%h/.config/drews-pokemon-app.env`, which is `chmod 600` and outside the repo.
+
+```ini
+[Unit]
+Description=Drew's Pokémon App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Developer/drew/pokemon_app
+EnvironmentFile=%h/.config/drews-pokemon-app.env
+ExecStart=/usr/local/bin/infisical run --projectId=${INFISICAL_PROJECT_ID} --env=prod -- \
+    %h/.local/bin/uv run python -m uvicorn api.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+```
+
+Confirm the two binary paths before installing, and correct the unit if they differ:
+
+```bash
+which infisical uv
+```
+
+- [ ] **Step 5: Write `deploy/install.sh`**
+
+```bash
+#!/usr/bin/env bash
+# Build the frontend, install the user service, and publish it on the tailnet.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT_NAME="drews-pokemon-app.service"
+
+echo "Building the frontend..."
+(cd "$REPO_ROOT/web" && npm ci && npm run build)
+
+echo "Installing the user service..."
+mkdir -p "$UNIT_DIR"
+cp "$REPO_ROOT/deploy/$UNIT_NAME" "$UNIT_DIR/$UNIT_NAME"
+systemctl --user daemon-reload
+systemctl --user enable --now "$UNIT_NAME"
+
+echo "Allowing the service to run without an active login..."
+loginctl enable-linger "$USER"
+
+echo "Publishing on the tailnet over HTTPS..."
+sudo tailscale serve --bg 8000
+
+echo
+systemctl --user --no-pager status "$UNIT_NAME" | head -12
+echo
+tailscale serve status
+```
+
+```bash
+chmod +x deploy/install.sh
+```
+
+- [ ] **Step 6: Set up the Infisical machine identity**
+
+Interactive and account-level, so Jordan runs this, not the implementer. He needs a machine identity with read access to the `drew-pokemon` project, then:
+
+```bash
+mkdir -p ~/.config
+cat > ~/.config/drews-pokemon-app.env <<'EOF'
+INFISICAL_TOKEN=<machine identity token>
+INFISICAL_PROJECT_ID=<project id from .infisical.json>
+EOF
+chmod 600 ~/.config/drews-pokemon-app.env
+```
+
+The project id is the `workspaceId` field in `.infisical.json`.
+
+- [ ] **Step 7: Install and verify the service is actually running**
+
+```bash
+./deploy/install.sh
+systemctl --user is-active drews-pokemon-app.service
+curl -s localhost:8000/api/health | head -c 200; echo
+```
+
+Expected: `active`, then the health JSON. If it is not active, read the logs before changing anything:
+
+```bash
+journalctl --user -u drews-pokemon-app.service -n 50 --no-pager
+```
+
+- [ ] **Step 8: Verify it survives a restart**
+
+```bash
+systemctl --user restart drews-pokemon-app.service
+sleep 3
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/api/health
+```
+
+Expected: `200`.
+
+- [ ] **Step 9: Verify the Tailscale URL and that nothing else is exposed**
+
+```bash
+tailscale serve status
+tailscale status --json | python3 -c "import json,sys; print(json.load(sys.stdin)['Self']['DNSName'])"
+ss -tlnp | grep 8000
+```
+
+Expected: `serve status` shows `https://<host>.<tailnet>.ts.net` proxying to `127.0.0.1:8000`, and `ss` shows the listener bound to `127.0.0.1`, not `0.0.0.0`. A `0.0.0.0` binding means the app is on the LAN and the `--host` flag in the unit is wrong.
+
+- [ ] **Step 10: Open it on the iPad**
+
+On Drew's iPad, connected to the tailnet, open `https://<host>.<tailnet>.ts.net`. Confirm the page loads with a valid certificate and no warning, ask one question, and confirm the artwork renders. Then Share → Add to Home Screen.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add deploy web/svelte.config.js web/src/routes/+layout.ts web/package.json
+git commit -m "feat: single-process deploy with systemd and tailscale serve"
+```
+
+---
+
 ### Task 22: End-to-end verification and README
 
 **Files:**
@@ -4784,6 +5341,29 @@ Ask all four and confirm the described result. Do not tick a box you have not se
 | "Show me Eevee's evolutions" | An evolution line with all eight |
 | "Tell me about pikchu" | A question back to Drew asking if he meant Pikachu |
 
+- [ ] **Step 2b: Verify the cost controls actually bite**
+
+Temporarily set the cap to a value already exceeded and confirm Drew gets a sentence, not an error:
+
+```bash
+curl -s localhost:8000/api/health | python3 -c "import json,sys; d=json.load(sys.stdin); print('spent', d['spent_today_usd'], 'of', d['daily_budget_usd'])"
+```
+
+Then, with the service stopped, run the app with a tiny cap and ask a question in the browser:
+
+```bash
+infisical run -- env POKEDEX_DAILY_BUDGET_USD=0.0000001 \
+  uv run python -m uvicorn api.app:app --host 127.0.0.1 --port 8000
+```
+
+Expected: the chat replies "That's all the Pokémon questions for today, Drew. Come back tomorrow!" with no red error banner, and `usage_log` gains no new row for that attempt.
+
+```bash
+sqlite3 data/pokedex.db "SELECT day, model, input_tokens, output_tokens, round(cost_usd,6) FROM usage_log ORDER BY id DESC LIMIT 5;"
+```
+
+Expected: one row per real question asked so far, with plausible token counts. If `cost_usd` is 0 for every row, token usage is not reaching `record_usage`.
+
 - [ ] **Step 3: Verify persistence**
 
 Reload the page, click the conversation in the sidebar, and confirm the messages and cards come back. Then delete it and confirm it disappears from the list after a reload.
@@ -4820,12 +5400,25 @@ artwork into `data/images/`. Pass `--skip-images` to skip the slow part.
 
 ## Running
 
+Development, two processes:
+
 ```bash
 infisical run -- uv run fastapi dev api/app.py --port 8000   # terminal one
-cd web && npm run dev                        # terminal two
+cd web && npm run dev                                        # terminal two
 ```
 
 Open http://localhost:5173.
+
+On the Minisforum it runs as one process under systemd, published to the tailnet:
+
+```bash
+./deploy/install.sh
+systemctl --user status drews-pokemon-app.service
+tailscale serve status
+```
+
+Drew opens `https://<host>.<tailnet>.ts.net` on his iPad. The app binds to
+`127.0.0.1` only; Tailscale is the only way in.
 
 ## How it works
 
@@ -4847,14 +5440,36 @@ cd web && npx vitest run   # frontend
 Tests never call OpenAI. `ALLOW_MODEL_REQUESTS` is off and the agent runs against
 `TestModel` and `FunctionModel`.
 
+## Cost
+
+Two independent limits.
+
+Per question, `UsageLimits(request_limit=8, tool_calls_limit=12,
+total_tokens_limit=20000)` stops a runaway tool loop. Per day, every turn's
+tokens are priced and logged to `usage_log`, and the app refuses past
+`$0.25` with a friendly message. The cap resets at local midnight.
+
+At `gpt-5.6-luna` prices a question costs about $0.0012, so the cap is roughly
+200 questions a day. The pricing table in `api/budget.py` is a hardcoded constant
+and must be updated when prices change. Unknown models are priced at the most
+expensive known rate so the cap never silently overspends.
+
+```bash
+curl -s localhost:8000/api/health   # spent_today_usd and daily_budget_usd
+```
+
 ## Configuration
 
-Both come from Infisical, injected by `infisical run --`.
+Secrets come from Infisical, injected by `infisical run --`.
 
-| Secret | Default | Meaning |
+| Setting | Default | Meaning |
 |---|---|---|
 | `OPENAI_API_KEY` | none, required | Your OpenAI key |
-| `POKEDEX_OPENAI_MODEL` | `openai:gpt-5.2` | Model, with the provider prefix. Optional. |
+| `POKEDEX_OPENAI_MODEL` | `openai:gpt-5.6-luna` | Model, with the provider prefix |
+| `POKEDEX_DAILY_BUDGET_USD` | `0.25` | Daily spend cap |
+| `POKEDEX_REQUEST_LIMIT` | `8` | Model turns per question |
+| `POKEDEX_TOOL_CALLS_LIMIT` | `12` | Tool calls per question |
+| `POKEDEX_TOTAL_TOKENS_LIMIT` | `20000` | Tokens per question |
 ````
 
 - [ ] **Step 6: Lint, format, and run everything once**
@@ -4879,6 +5494,8 @@ git commit -m "docs: README and verified end-to-end run"
 
 Checked after writing:
 
-- **Spec coverage.** Every spec section maps to a task. Ingest from CSVs is Tasks 2-7; images Task 6; the five tools Tasks 11-12; `run_sql` guardrails Task 10; streaming Tasks 15-16; persistence Task 14; the cards Tasks 19-21; branding in Task 1 (`package.json`, `pyproject.toml`), Task 13 (system prompt), Task 17 (browser title), Task 21 (header, `EmptyState`); kid-friendly tone in Tasks 13, 19, 20, 21. The spec's "no battle simulator" line is enforced by the system prompt instruction to flag judgement calls, verified in Task 22 Step 2.
+- **Spec coverage.** Every spec section maps to a task. Ingest from CSVs is Tasks 2-7; images Task 6; the five tools Tasks 11-12; `run_sql` guardrails Task 10; streaming Tasks 15-16; persistence Task 14; cost control Tasks 14b, 15, 16; the cards Tasks 19-21; deployment, systemd, and Tailscale Task 21b; branding in Task 1 (`package.json`, `pyproject.toml`), Task 13 (system prompt), Task 17 (browser title), Task 21 (header, `EmptyState`); kid-friendly tone in Tasks 13, 19, 20, 21, and in both limit messages. The spec's "no battle simulator" line is enforced by the system prompt instruction to flag judgement calls, verified in Task 22 Step 2.
 - **Type consistency.** `PokemonProfile`, `BaseStats`, `FindPokemonResult`, `MatchupReport`, `Comparison`, `EvolutionChain`, `SqlResult`, and `ToolEvent` are defined once in `api/models.py` (Tasks 9 and 14) and mirrored field-for-field in `web/src/lib/types.ts` (Task 17). `artwork_path`/`sprite_path` from `v_pokemon` (Task 5) become `/images/...` URLs in `api/tools.py` (Task 11) and are consumed by `PokemonCard` (Task 19). The five tool names are identical in `api/agent.py`, `ToolChip`, and `ToolResult`.
+- **Cost-control consistency.** The per-run caps are defined once in `Settings` (Task 1), passed into `UsageLimits` in `api/app.py` (Task 16), threaded through `stream_turn` (Task 15), and surfaced to Drew by `LIMIT_MESSAGE`. The daily cap lives in `api/budget.py` (Task 14b), is checked before the model runs and recorded after (Task 16), shown by `/api/health`, and rendered by the `limit` branch in `chat.svelte.ts` (Task 18). Two distinct messages, both kid-friendly: `LIMIT_MESSAGE` for a loop, `BUDGET_MESSAGE` for the daily cap.
+- **Two things only Jordan can do**, both called out in the steps that need them rather than assumed: `infisical init` (Task 1, Step 3) and the Infisical machine identity for the unattended service (Task 21b, Step 6).
 - **Placeholders.** None. Every code step carries the actual code.
