@@ -1,0 +1,15 @@
+@import 'tailwindcss';
+
+@theme inline {
+	--color-ink: #1b1b1f;
+	--color-paper: #fdfcf7;
+	--color-panel: #ffffff;
+	--color-accent: #d94f3d;
+	--font-display: 'Trebuchet MS', 'Verdana', sans-serif;
+	--radius-card: 1.25rem;
+}
+
+body {
+	background: var(--color-paper);
+	color: var(--color-ink);
+}
