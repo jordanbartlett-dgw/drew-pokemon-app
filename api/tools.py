@@ -5,7 +5,18 @@ import sqlite3
 from typing import Any
 
 from api.db import query
-from api.models import BaseStats, FindPokemonResult, PokemonProfile
+from api.models import (
+    BaseStats,
+    Comparison,
+    EvolutionChain,
+    EvolutionStep,
+    FindPokemonResult,
+    MatchupReport,
+    PokemonProfile,
+    SqlResult,
+    TypeMatchup,
+)
+from api.sql_guard import MAX_ROWS, validate_sql
 
 IMAGE_URL_PREFIX = "/images/"
 
@@ -73,3 +84,101 @@ def find_pokemon(conn: sqlite3.Connection, name_or_id: str) -> FindPokemonResult
     slugs = [row["slug"] for row in query(conn, "SELECT slug FROM v_pokemon")]
     candidates = difflib.get_close_matches(needle, slugs, n=5, cutoff=0.7)
     return FindPokemonResult(pokemon=None, candidates=candidates)
+
+
+def _known_types(conn: sqlite3.Connection) -> dict[str, str]:
+    rows = query(conn, "SELECT DISTINCT attacking AS name FROM v_type_matchup")
+    rows += query(conn, "SELECT DISTINCT defending AS name FROM v_type_matchup")
+    return {row["name"].lower(): row["name"] for row in rows}
+
+
+def type_matchup(conn: sqlite3.Connection, attacking: str, defending: str) -> MatchupReport:
+    """How much damage `attacking` does to `defending`. Dual types use 'Water/Flying'."""
+    known = _known_types(conn)
+
+    def resolve(name: str) -> str:
+        key = name.strip().lower()
+        if key not in known:
+            raise ValueError(
+                f"{name} is not a Pokémon type. Known types: {', '.join(sorted(known.values()))}"
+            )
+        return known[key]
+
+    attack_type = resolve(attacking)
+    defend_types = [resolve(part) for part in defending.split("/") if part.strip()]
+
+    matchups: list[TypeMatchup] = []
+    combined = 1.0
+    for defend_type in defend_types:
+        rows = query(
+            conn,
+            "SELECT multiplier FROM v_type_matchup WHERE attacking = ? AND defending = ?",
+            (attack_type, defend_type),
+        )
+        multiplier = rows[0]["multiplier"] if rows else 1.0
+        matchups.append(
+            TypeMatchup(attacking=attack_type, defending=defend_type, multiplier=multiplier)
+        )
+        combined *= multiplier
+
+    return MatchupReport(
+        attacking_types=[attack_type],
+        defending_types=defend_types,
+        matchups=matchups,
+        combined_multiplier=combined,
+    )
+
+
+def compare(conn: sqlite3.Connection, names: list[str]) -> Comparison:
+    """Side-by-side profiles. Names that do not resolve are dropped."""
+    profiles = [
+        result.pokemon
+        for result in (find_pokemon(conn, name) for name in names)
+        if result.pokemon is not None
+    ]
+    if not profiles:
+        return Comparison(pokemon=[], fastest="", highest_total="")
+
+    fastest = max(profiles, key=lambda p: p.stats.speed)
+    strongest = max(profiles, key=lambda p: p.stats.total)
+    return Comparison(pokemon=profiles, fastest=fastest.name, highest_total=strongest.name)
+
+
+def evolution_chain(conn: sqlite3.Connection, name: str) -> EvolutionChain | None:
+    """Every step in the evolution line the named Pokémon belongs to."""
+    found = find_pokemon(conn, name)
+    if found.pokemon is None:
+        return None
+
+    chain_rows = query(
+        conn,
+        "SELECT evolution_chain_id AS chain_id FROM pokemon_species WHERE id = ?",
+        (found.pokemon.id,),
+    )
+    if not chain_rows or chain_rows[0]["chain_id"] is None:
+        return None
+    chain_id = chain_rows[0]["chain_id"]
+
+    steps = query(
+        conn,
+        "SELECT from_name, to_name, trigger, min_level FROM v_evolution WHERE chain_id = ?",
+        (chain_id,),
+    )
+    return EvolutionChain(
+        chain_id=chain_id,
+        steps=[EvolutionStep(**step) for step in steps],
+    )
+
+
+def run_sql(conn: sqlite3.Connection, sql: str) -> SqlResult:
+    """Run a read-only SELECT against the Pokédex. Raises UnsafeSqlError if rejected."""
+    safe_sql = validate_sql(sql)
+    rows = query(conn, safe_sql)
+    columns = list(rows[0].keys()) if rows else []
+    return SqlResult(
+        sql=safe_sql,
+        columns=columns,
+        rows=rows,
+        row_count=len(rows),
+        truncated=len(rows) >= MAX_ROWS,
+    )

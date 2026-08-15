@@ -52,8 +52,8 @@ INSERT INTO abilities VALUES (9,'static',3,1),(66,'blaze',3,1),(67,'torrent',3,1
 INSERT INTO ability_names VALUES (9,9,'Static'),(66,9,'Blaze'),(67,9,'Torrent');
 INSERT INTO pokemon_abilities VALUES (25,9,0,1),(26,9,0,1),(6,66,0,1),(7,67,0,1);
 INSERT INTO evolution_triggers VALUES (1,'level-up'),(3,'use-item');
-INSERT INTO pokemon_evolution (id,evolved_species_id,evolution_trigger_id,minimum_level)
-    VALUES (1,26,3,NULL),(2,6,1,36);
+INSERT INTO pokemon_evolution (id,evolved_species_id,evolution_trigger_id,minimum_level,is_default)
+    VALUES (1,26,3,NULL,1),(2,6,1,36,1);
 """
 
 
