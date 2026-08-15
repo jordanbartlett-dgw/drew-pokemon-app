@@ -1042,7 +1042,9 @@ git commit -m "feat: denormalized views for agent queries"
 
 **Interfaces:**
 - Consumes: `ingest.source.sparse_clone`, `ingest.source.SPRITES_REPO`
-- Produces: `ingest.images.download_images(checkout: Path, images_dir: Path) -> int` returning files copied, and `SPRITE_PATHS: list[str]` naming the two sparse-checkout directories.
+- Produces: `ingest.images.download_images(checkout: Path, images_dir: Path) -> CopyResult` where `CopyResult` is a `NamedTuple(copied: int, skipped: int)`, and `SPRITE_PATHS: list[str]` naming the two sparse-checkout directories.
+
+> **Amendment (2026-08-15, ruled during execution).** Three changes to the Step 3 code and Step 1 tests below. (1) `download_images` returns `CopyResult(copied, skipped)`, not a bare int — the original counted files *matched*, so a re-run claimed to have copied thousands of files while copying nothing. (2) A destination counts as complete only when it exists AND its size matches the source; otherwise it is re-copied with `shutil.copy2`. The original accepted a truncated PNG from an interrupted run as done, forever. (3) `SPRITE_PATHS` is derived as `list(_SOURCES.values())` rather than hand-duplicated. Implemented in `9e4c064`.
 
 Layout inside the sprites repo: `sprites/pokemon/other/official-artwork/<id>.png` for the big art, `sprites/pokemon/<id>.png` for the small game sprite. These are copied to `<images_dir>/official-artwork/<id>.png` and `<images_dir>/front-default/<id>.png`, matching `artwork_path` and `sprite_path` in `v_pokemon`.
 
@@ -1331,8 +1333,8 @@ def main() -> int:
     else:
         print("Cloning sprites (this is the slow part, several minutes)...")
         sprite_checkout = sparse_clone(SPRITES_REPO, SPRITE_PATHS, args.cache / "sprites")
-        copied = download_images(sprite_checkout, args.images_dir)
-        print(f"  {copied:,} images")
+        images = download_images(sprite_checkout, args.images_dir)
+        print(f"  {images.copied:,} copied, {images.skipped:,} already present")
 
     failures = verify(args.db)
     if failures:
