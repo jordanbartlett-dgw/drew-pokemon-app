@@ -32,6 +32,28 @@ def test_sparse_clone_skips_when_already_present(tmp_path, monkeypatch):
 
     dest = tmp_path / "checkout"
     (dest / ".git").mkdir(parents=True)
+    (dest / "data/v2/csv").mkdir(parents=True)
 
     assert sparse_clone(CSV_REPO, ["data/v2/csv"], dest) == dest
     assert calls == []
+
+
+def test_sparse_clone_repairs_incomplete_checkout(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("ingest.source.subprocess.run", fake_run)
+
+    dest = tmp_path / "checkout"
+    (dest / ".git").mkdir(parents=True)
+
+    assert sparse_clone(CSV_REPO, ["data/v2/csv"], dest) == dest
+    assert len(calls) == 1
+    assert calls[0][:4] == ["git", "sparse-checkout", "set", "data/v2/csv"]
