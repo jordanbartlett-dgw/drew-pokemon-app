@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
 from api.budget import (
     BUDGET_MESSAGE,
     PRICING_USD_PER_MTOK,
@@ -11,7 +13,8 @@ from api.budget import (
     record_usage,
     spent_today,
 )
-from api.store import open_store
+from api.store import create_conversation, load_turns, open_store, save_turn
+from api.store import ensure_schema as ensure_store_schema
 
 
 def _conn(pokedex_path):
@@ -97,3 +100,33 @@ def test_record_usage_is_safe_under_concurrent_writers(pokedex_path):
     row = conn.execute("SELECT COUNT(*) AS c FROM usage_log").fetchone()
     assert row["c"] == n
     assert round(spent_today(conn), 8) == round(sum(costs), 8)
+
+
+def test_save_turn_and_record_usage_share_a_lock_on_one_connection(pokedex_path):
+    """Important 3: api/main.py hands the SAME sqlite3.Connection to both
+    api/store.py's save_turn and api/budget.py's record_usage. If each module
+    guarded it with its own independent lock, the two could interleave mid-write on
+    that one connection -- both modules must serialize through api/lock.store_lock."""
+    conn = open_store(pokedex_path)
+    ensure_store_schema(conn)
+    ensure_schema(conn)
+    cid = create_conversation(conn, "concurrent chat")
+    n = 30
+
+    def _messages(text: str):
+        return [
+            ModelRequest(parts=[UserPromptPart(content=text)]),
+            ModelResponse(parts=[TextPart(content="ok")]),
+        ]
+
+    def _turn(i: int) -> None:
+        save_turn(conn, cid, f"q{i}", f"a{i}", [], _messages(f"q{i}"))
+        record_usage(conn, "openai:gpt-5.6-luna", 1_000, 100)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_turn, range(n)))
+
+    turns = load_turns(conn, cid)
+    assert len(turns) == n
+    usage_rows = conn.execute("SELECT COUNT(*) AS c FROM usage_log").fetchone()
+    assert usage_rows["c"] == n

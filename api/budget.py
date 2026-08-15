@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
-import threading
+
+from api.lock import store_lock as _lock
 
 # Dollars per million tokens, (input, output).
 # Source: https://developers.openai.com/api/docs/pricing, checked 2026-08-15.
@@ -14,8 +15,6 @@ PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
 }
 
 BUDGET_MESSAGE = "That's all the Pokémon questions for today, Drew. Come back tomorrow!"
-
-_lock = threading.Lock()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_log (
