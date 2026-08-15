@@ -272,6 +272,8 @@ git commit -m "feat: project scaffold and settings"
 - Consumes: nothing
 - Produces: `ingest.source.sparse_clone(repo_url: str, paths: list[str], dest: Path) -> Path` returning `dest`; `CSV_REPO`, `SPRITES_REPO`, `CSV_PATH_IN_REPO = "data/v2/csv"` constants.
 
+> **Amendment (2026-08-15, ruled during execution).** The Step 1 test and Step 3 code below skip the clone whenever `dest/.git` exists. That caches a half-finished checkout forever: if `git clone` succeeds but `git sparse-checkout set` is then interrupted, the repair never runs. As shipped, `sparse_clone` skips only when `.git` **and** every requested path exist, and repairs a `.git`-without-paths checkout by re-running `sparse-checkout set` without re-cloning. `test_sparse_clone_skips_when_already_present` creates both `.git` and the path; a second test covers the repair path. Implemented in `a79beeb`.
+
 - [ ] **Step 1: Write the failing test**
 
 The clone itself is network work, so the test asserts the git commands are correct rather than hitting GitHub.
@@ -417,7 +419,16 @@ def test_pokemon_table_has_expected_columns():
     conn = sqlite3.connect(":memory:")
     apply_schema(conn)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(pokemon)")]
-    assert cols == ["id", "identifier", "species_id", "height", "weight", "base_experience", "order_", "is_default"]
+    assert cols == [
+        "id",
+        "identifier",
+        "species_id",
+        "height",
+        "weight",
+        "base_experience",
+        "order_",
+        "is_default",
+    ]
 
 
 def test_type_efficacy_table_has_expected_columns():
@@ -649,13 +660,24 @@ def write(tmp_path, name, text):
 
 
 def test_load_table_inserts_rows(conn, tmp_path):
-    csv = write(tmp_path, "types", "id,identifier,generation_id,damage_class_id\n10,fire,1,3\n11,water,1,3\n")
+    csv = write(
+        tmp_path,
+        "types",
+        "id,identifier,generation_id,damage_class_id\n10,fire,1,3\n11,water,1,3\n",
+    )
     assert load_table(conn, "types", csv) == 2
-    assert [r["identifier"] for r in conn.execute("SELECT identifier FROM types ORDER BY id")] == ["fire", "water"]
+    assert [r["identifier"] for r in conn.execute("SELECT identifier FROM types ORDER BY id")] == [
+        "fire",
+        "water",
+    ]
 
 
 def test_load_table_renames_order_column(conn, tmp_path):
-    csv = write(tmp_path, "pokemon", "id,identifier,species_id,height,weight,base_experience,order,is_default\n25,pikachu,25,4,60,112,32,1\n")
+    csv = write(
+        tmp_path,
+        "pokemon",
+        "id,identifier,species_id,height,weight,base_experience,order,is_default\n25,pikachu,25,4,60,112,32,1\n",
+    )
     load_table(conn, "pokemon", csv)
     row = conn.execute("SELECT * FROM pokemon").fetchone()
     assert row["order_"] == 32
@@ -663,7 +685,11 @@ def test_load_table_renames_order_column(conn, tmp_path):
 
 
 def test_load_table_converts_empty_string_to_null(conn, tmp_path):
-    csv = write(tmp_path, "moves", "id,identifier,generation_id,type_id,power,pp,accuracy,priority,target_id,damage_class_id,effect_id,effect_chance,contest_type_id,contest_effect_id,super_contest_effect_id\n1,pound,1,1,40,35,100,0,10,2,1,,5,1,5\n")
+    csv = write(
+        tmp_path,
+        "moves",
+        "id,identifier,generation_id,type_id,power,pp,accuracy,priority,target_id,damage_class_id,effect_id,effect_chance,contest_type_id,contest_effect_id,super_contest_effect_id\n1,pound,1,1,40,35,100,0,10,2,1,,5,1,5\n",
+    )
     load_table(conn, "moves", csv)
     assert conn.execute("SELECT effect_chance FROM moves").fetchone()[0] is None
 
@@ -675,7 +701,11 @@ def test_load_table_english_only_filters_local_language_id(conn, tmp_path):
 
 
 def test_load_table_english_only_filters_language_id(conn, tmp_path):
-    csv = write(tmp_path, "pokemon_species_flavor_text", "species_id,version_id,language_id,flavor_text\n25,1,9,Zap!\n25,1,5,Zap en francais\n")
+    csv = write(
+        tmp_path,
+        "pokemon_species_flavor_text",
+        "species_id,version_id,language_id,flavor_text\n25,1,9,Zap!\n25,1,5,Zap en francais\n",
+    )
     assert load_table(conn, "pokemon_species_flavor_text", csv, english_only=True) == 1
 
 
@@ -719,9 +749,7 @@ def load_table(
         source_columns = reader.fieldnames or []
         target_columns = ["order_" if c == "order" else c for c in source_columns]
 
-        language_column = next(
-            (c for c in _LANGUAGE_COLUMNS if c in source_columns), None
-        )
+        language_column = next((c for c in _LANGUAGE_COLUMNS if c in source_columns), None)
 
         placeholders = ",".join("?" for _ in target_columns)
         sql = f"INSERT INTO {table} ({','.join(target_columns)}) VALUES ({placeholders})"
@@ -847,11 +875,17 @@ def test_v_pokemon_shape(conn):
 
 
 def test_v_pokemon_uses_newest_flavor_text(conn):
-    assert conn.execute("SELECT flavor_text FROM v_pokemon WHERE id = 25").fetchone()[0] == "Newest entry."
+    assert (
+        conn.execute("SELECT flavor_text FROM v_pokemon WHERE id = 25").fetchone()[0]
+        == "Newest entry."
+    )
 
 
 def test_v_type_matchup_multipliers(conn):
-    rows = {(r["attacking"], r["defending"]): r["multiplier"] for r in conn.execute("SELECT * FROM v_type_matchup")}
+    rows = {
+        (r["attacking"], r["defending"]): r["multiplier"]
+        for r in conn.execute("SELECT * FROM v_type_matchup")
+    }
     assert rows[("Ground", "Electric")] == 2.0
     assert rows[("Electric", "Ground")] == 0.0
 
@@ -1440,9 +1474,7 @@ def open_read_only(db_path: Path) -> sqlite3.Connection:
         raise FileNotFoundError(
             f"{db_path} does not exist. Run `uv run python -m ingest.sync` first."
         )
-    conn = sqlite3.connect(
-        f"file:{db_path}?mode=ro", uri=True, check_same_thread=False
-    )
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -1494,9 +1526,17 @@ def test_base_stats_total():
 
 def test_pokemon_profile_builds_image_urls():
     profile = PokemonProfile(
-        id=25, name="Pikachu", slug="pikachu", generation=1, types=["Electric"],
-        stats=BaseStats(hp=35, attack=55, defense=40, special_attack=50, special_defense=50, speed=90),
-        height_m=0.4, weight_kg=6.0, abilities=["Static"],
+        id=25,
+        name="Pikachu",
+        slug="pikachu",
+        generation=1,
+        types=["Electric"],
+        stats=BaseStats(
+            hp=35, attack=55, defense=40, special_attack=50, special_defense=50, speed=90
+        ),
+        height_m=0.4,
+        weight_kg=6.0,
+        abilities=["Static"],
         artwork_url="/images/official-artwork/25.png",
         sprite_url="/images/front-default/25.png",
     )
@@ -1506,10 +1546,19 @@ def test_pokemon_profile_builds_image_urls():
 
 
 def test_type_matchup_label_reads_plainly():
-    assert TypeMatchup(attacking="Water", defending="Fire", multiplier=2.0).label == "super effective"
-    assert TypeMatchup(attacking="Fire", defending="Water", multiplier=0.5).label == "not very effective"
-    assert TypeMatchup(attacking="Electric", defending="Ground", multiplier=0.0).label == "no effect"
-    assert TypeMatchup(attacking="Normal", defending="Normal", multiplier=1.0).label == "normal damage"
+    assert (
+        TypeMatchup(attacking="Water", defending="Fire", multiplier=2.0).label == "super effective"
+    )
+    assert (
+        TypeMatchup(attacking="Fire", defending="Water", multiplier=0.5).label
+        == "not very effective"
+    )
+    assert (
+        TypeMatchup(attacking="Electric", defending="Ground", multiplier=0.0).label == "no effect"
+    )
+    assert (
+        TypeMatchup(attacking="Normal", defending="Normal", multiplier=1.0).label == "normal damage"
+    )
 
 
 def test_sql_result_flags_truncation():
@@ -1683,11 +1732,15 @@ from api.sql_guard import MAX_ROWS, UnsafeSqlError, validate_sql
 
 
 def test_adds_limit_when_missing():
-    assert validate_sql("SELECT name FROM v_pokemon") == f"SELECT name FROM v_pokemon LIMIT {MAX_ROWS}"
+    assert (
+        validate_sql("SELECT name FROM v_pokemon") == f"SELECT name FROM v_pokemon LIMIT {MAX_ROWS}"
+    )
 
 
 def test_keeps_small_limit():
-    assert validate_sql("SELECT name FROM v_pokemon LIMIT 5") == "SELECT name FROM v_pokemon LIMIT 5"
+    assert (
+        validate_sql("SELECT name FROM v_pokemon LIMIT 5") == "SELECT name FROM v_pokemon LIMIT 5"
+    )
 
 
 def test_caps_oversized_limit():
@@ -1720,7 +1773,9 @@ def test_rejects_unsafe_sql(sql):
 
 
 def test_allows_leading_cte():
-    out = validate_sql("WITH fast AS (SELECT * FROM v_pokemon WHERE speed > 100) SELECT name FROM fast")
+    out = validate_sql(
+        "WITH fast AS (SELECT * FROM v_pokemon WHERE speed > 100) SELECT name FROM fast"
+    )
     assert out.endswith(f"LIMIT {MAX_ROWS}")
 ```
 
@@ -2329,7 +2384,9 @@ async def test_find_pokemon_tool_returns_a_profile(pokedex):
     with capture_run_messages() as messages:
         await agent.run("Who is Pikachu?", deps=PokedexDeps(conn=pokedex))
 
-    returned = [p for m in messages for p in m.parts if getattr(p, "part_kind", "") == "tool-return"]
+    returned = [
+        p for m in messages for p in m.parts if getattr(p, "part_kind", "") == "tool-return"
+    ]
     assert returned[0].content.pokemon.name == "Pikachu"
 
 
@@ -2342,7 +2399,9 @@ async def test_bad_sql_comes_back_as_a_retry_not_a_crash(pokedex):
             return ModelResponse(parts=[ToolCallPart("run_sql", {"sql": "DROP TABLE pokemon"})])
         if len(attempts) == 1:
             attempts.append("good")
-            return ModelResponse(parts=[ToolCallPart("run_sql", {"sql": "SELECT name FROM v_pokemon"})])
+            return ModelResponse(
+                parts=[ToolCallPart("run_sql", {"sql": "SELECT name FROM v_pokemon"})]
+            )
         return ModelResponse(parts=[TextPart("Here you go, Drew!")])
 
     agent = build_agent(FunctionModel(call_sql))
@@ -2436,9 +2495,7 @@ def build_agent(model: str | Model) -> Agent[PokedexDeps]:
         return tools.find_pokemon(ctx.deps.conn, name_or_id)
 
     @agent.tool
-    def type_matchup(
-        ctx: RunContext[PokedexDeps], attacking: str, defending: str
-    ) -> MatchupReport:
+    def type_matchup(ctx: RunContext[PokedexDeps], attacking: str, defending: str) -> MatchupReport:
         """How effective an attacking type is. Dual types look like 'Water/Flying'."""
         try:
             return tools.type_matchup(ctx.deps.conn, attacking, defending)
@@ -2568,7 +2625,9 @@ def test_title_from_truncates_long_questions():
 def test_save_and_load_a_turn(pokedex_path):
     conn = _store(pokedex_path)
     cid = create_conversation(conn, "Pikachu chat")
-    events = [ToolEvent(tool_name="find_pokemon", args={"name_or_id": "pikachu"}, result={"id": 25})]
+    events = [
+        ToolEvent(tool_name="find_pokemon", args={"name_or_id": "pikachu"}, result={"id": 25})
+    ]
     save_turn(conn, cid, "Who is Pikachu?", "A mouse!", events, _messages("Who is Pikachu?"))
 
     turns = load_turns(conn, cid)
@@ -2914,9 +2973,7 @@ PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     "openai:gpt-5-mini": (0.25, 2.00),
 }
 
-BUDGET_MESSAGE = (
-    "That's all the Pokémon questions for today, Drew. Come back tomorrow!"
-)
+BUDGET_MESSAGE = "That's all the Pokémon questions for today, Drew. Come back tomorrow!"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_log (
@@ -2952,8 +3009,7 @@ def record_usage(
 ) -> float:
     cost = price_of(model, input_tokens, output_tokens)
     conn.execute(
-        "INSERT INTO usage_log (model, input_tokens, output_tokens, cost_usd) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO usage_log (model, input_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, ?)",
         (model, input_tokens, output_tokens, cost),
     )
     conn.commit()
@@ -3031,7 +3087,9 @@ def _parse(frames: list[str]) -> list[tuple[str, dict]]:
     parsed = []
     for raw in frames:
         lines = raw.strip().split("\n")
-        parsed.append((lines[0].removeprefix("event: "), json.loads(lines[1].removeprefix("data: "))))
+        parsed.append(
+            (lines[0].removeprefix("event: "), json.loads(lines[1].removeprefix("data: ")))
+        )
     return parsed
 
 
@@ -3045,7 +3103,9 @@ async def test_streams_tokens_and_tool_results(pokedex):
     agent = build_agent(FunctionModel(script))
     frames = [
         f
-        async for f in stream_turn(agent, PokedexDeps(conn=pokedex), "Who is Pikachu?", [], recorder)
+        async for f in stream_turn(
+            agent, PokedexDeps(conn=pokedex), "Who is Pikachu?", [], recorder
+        )
     ]
     events = _parse(frames)
 
@@ -3102,9 +3162,7 @@ async def test_model_failure_emits_an_error_frame(pokedex):
 
     recorder = TurnRecorder()
     agent = build_agent(FunctionModel(boom))
-    frames = [
-        f async for f in stream_turn(agent, PokedexDeps(conn=pokedex), "Who?", [], recorder)
-    ]
+    frames = [f async for f in stream_turn(agent, PokedexDeps(conn=pokedex), "Who?", [], recorder)]
     names = [name for name, _ in _parse(frames)]
     assert names[-1] == "error"
 ```
@@ -3145,9 +3203,7 @@ def frame(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-LIMIT_MESSAGE = (
-    "Whoa, that question sent me in circles! Try asking it a different way, Drew."
-)
+LIMIT_MESSAGE = "Whoa, that question sent me in circles! Try asking it a different way, Drew."
 
 
 @dataclass
@@ -3532,9 +3588,7 @@ def create_app(
                 yield chunk
 
             if recorder.input_tokens or recorder.output_tokens:
-                record_usage(
-                    store_conn, model_id, recorder.input_tokens, recorder.output_tokens
-                )
+                record_usage(store_conn, model_id, recorder.input_tokens, recorder.output_tokens)
 
             if recorder.new_messages:
                 save_turn(
