@@ -58,26 +58,37 @@ Open http://localhost:5173. Vite proxies `/api` and `/images` to `:8000`.
 Do not use `fastapi dev`; it requires `fastapi[standard]`, which is not a
 dependency of this project. `uv run uvicorn ...` is the supported entry point.
 
-On the Minisforum it runs as a single process under systemd, published to the
-tailnet.
+On the Minisforum it runs as one container under Dokploy, published to the
+tailnet. See "Deploying" below.
+
+## Deploying
+
+One image serves the API, the built frontend and the artwork. `Dockerfile` has
+two stages: Node builds `web/`, then Python 3.12 with uv installs from
+`uv.lock`. The container runs as uid 1000 and listens on port 8000.
+
+`data/` is not in the image. On the Minisforum it lives at
+`/srv/apps/drew-pokemon/data` and is bind-mounted to `/app/data`. It holds
+`pokedex.db`, `images/` and `app.db`. Back up `app.db`; the rest can be rebuilt
+with `ingest.sync`.
 
 ### Creating the Infisical machine identity
 
-The service runs unattended, so it cannot use your interactive `infisical
-login` — that session expires. It authenticates as a **machine identity**
+The container runs unattended, so it cannot use your interactive `infisical
+login`. That session expires. It authenticates as a **machine identity**
 instead.
 
 1. In Infisical, go to **Organization Access Control → Identities → Create
    Identity**. Name it something like `drews-pokemon-app`. The organisation
    role can be *No Access*; project access is granted separately in step 3.
 2. On that identity, add **Universal Auth** as the authentication method. Copy
-   the **Client ID**, then create a **Client Secret** and copy it — the secret
+   the **Client ID**, then create a **Client Secret** and copy it. The secret
    is shown once and cannot be retrieved later.
 3. Open the **drew-pokemon** project → **Access Control → Identities → Add
    Identity**, select the identity, and give it a role with read access to
    secrets in the **prod** environment. Viewer is enough.
 
-Verify it works before installing anything:
+Verify it works before deploying:
 
 ```bash
 token=$(infisical login --method=universal-auth \
@@ -89,41 +100,43 @@ infisical run --projectId=5c61531e-4dac-4347-b133-ff60bc484db5 \
 That should print `OPENAI_API_KEY`. If it prints nothing, the identity does not
 have access to the prod environment of that project.
 
-### The environment file
+### Dokploy settings
 
-`deploy/drews-pokemon-app.service` declares `EnvironmentFile` with no leading
-`-`, so systemd refuses to start without it:
+| Setting | Value |
+|---|---|
+| Source | GitHub, `jordanbartlett-dgw/drew-pokemon-app`, branch `main` |
+| Build type | Dockerfile, path `Dockerfile` |
+| Bind mount | host `/srv/apps/drew-pokemon/data` to `/app/data` |
+| Domain | the tailnet hostname, container port 8000, HTTPS off |
 
-```bash
-mkdir -p ~/.config
-cat > ~/.config/drews-pokemon-app.env <<'EOF'
+Environment:
+
+```
 INFISICAL_CLIENT_ID=<client id from step 2>
 INFISICAL_CLIENT_SECRET=<client secret from step 2>
 INFISICAL_PROJECT_ID=5c61531e-4dac-4347-b133-ff60bc484db5
-EOF
-chmod 600 ~/.config/drews-pokemon-app.env
 ```
 
-Note this holds the client id and secret, **not** a token. Universal Auth
-access tokens expire, so `deploy/run.sh` mints a fresh one on every service
-start. A static token would work until the first reboot after it expired and
-then fail with a confusing auth error. `install.sh` checks all three variables
-are present before installing anything.
+These are the client id and secret, **not** a token. Universal Auth access
+tokens expire, so `deploy/entrypoint.sh` mints a fresh one on every container
+start and hands it to `infisical run`, which injects `OPENAI_API_KEY`. A static
+token would work until the first restart after it expired and then fail with a
+confusing auth error.
+
+HTTPS is off in Dokploy because TLS comes from `tailscale serve`, which fronts
+Traefik on the box. Drew opens `https://<host>.<tailnet>.ts.net` on his iPad.
+Tailscale is the only way in.
+
+### Running the image locally
 
 ```bash
-./deploy/install.sh
-systemctl --user status drews-pokemon-app.service
-tailscale serve status
+docker build -t drew-pokemon:local .
+docker run --rm -p 127.0.0.1:8001:8000 -v "$PWD/data:/app/data" \
+  -e INFISICAL_CLIENT_ID=... -e INFISICAL_CLIENT_SECRET=... \
+  -e INFISICAL_PROJECT_ID=5c61531e-4dac-4347-b133-ff60bc484db5 \
+  drew-pokemon:local
+curl -s localhost:8001/api/health
 ```
-
-`install.sh` builds the frontend into `web/build`, installs the user systemd
-unit, and publishes port 8000 over Tailscale HTTPS. It needs the env file above and
-`sudo` for `tailscale serve`. The script preflights that the env file exists
-and holds all three variables, and that the `infisical` and `uv` paths in
-`deploy/run.sh` still match what's on `PATH`, before touching anything.
-
-Drew opens `https://<host>.<tailnet>.ts.net` on his iPad. The app binds to
-`127.0.0.1` only; Tailscale is the only way in.
 
 ## How it works
 

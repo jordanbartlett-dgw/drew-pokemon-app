@@ -16,10 +16,10 @@ Most likely first thing to hit: **the message list does not autoscroll while an
 answer streams in.** The composer is `sticky bottom-4`, but nothing scrolls the
 list, so a long answer grows below the fold and Drew has to scroll by hand.
 
-**The deploy has never run.** `deploy/install.sh` and the systemd unit are
-written and statically checked, with a preflight that fails loudly. Installing
-needs an Infisical machine identity and sudo. Expect one round of friction on
-first `systemctl --user start`.
+**The container deploy is new (2026-11-18).** It replaced the systemd unit, which
+was never installed. The image was built and run locally against the real
+`data/`: health, frontend, artwork and conversations all answered. See the
+README's "Deploying" section.
 
 ## Parked, with reasoning
 
@@ -60,11 +60,6 @@ the codebase's tab/single-quote style. Add a config before anyone reaches for it
 `PRICING_USD_PER_MTOK` is correct as of 2026-08-15. If OpenAI raises
 `gpt-5.6-luna`, the $0.25 cap silently becomes a larger cap. Unknown models
 already fall back to the most expensive known rate, which fails safe.
-
-**The `infisical` path in the systemd unit is nvm-version-pinned.** A Node
-upgrade moves it and the service stops starting at boot. `install.sh`'s
-preflight catches it at install time and names the offending path; re-run
-`./deploy/install.sh` after upgrading Node.
 
 **`run_sql` correctness is bounded by the guard, not by semantics.** The guard
 proves a query is safe, not that it is right. A subtly wrong join gives Drew a
